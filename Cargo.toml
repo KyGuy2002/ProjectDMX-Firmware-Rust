@@ -1,0 +1,69 @@
+[package]
+name = "pico_rust_template"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pico_rust_template"
+path = "src/main.rs"
+
+[features]
+default = ["dev"]
+
+dev = ["defmt", "defmt-rtt", "embassy-rp/defmt", "panic-probe", "panic-probe/defmt"]
+dev_sh = ["cortex-m-semihosting", "panic-semihosting"]
+production = ["panic-halt"]
+panic-halt = ["dep:panic-halt"]
+panic-probe = ["dep:panic-probe"]
+
+[dependencies]
+# Embassy async runtime for RP2350
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread"] }
+embassy-rp = { version = "0.9", features = ["rt", "rp235xb", "time-driver", "binary-info", "unstable-pac", "critical-section-impl"] }
+embassy-time = { version = "0.5" }
+embassy-sync = { version = "0.7" }
+embassy-futures = { version = "0.1" }
+
+# Embedded basics
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+critical-section = "1.1"
+
+# State machine
+statig = { version = "0.4", default-features = false, features = ["macro"] }
+
+# Memory allocator (for later use)
+o1heap = "0.0.2"
+
+# Data structures for embedded
+heapless = "0.8"
+
+# USB support
+embassy-usb = { version = "0.5" }
+static_cell = "2.1"
+
+# Logging (optional, for dev)
+defmt = { version = "1.0", optional = true }
+defmt-rtt = { version = "1.0", optional = true }
+cortex-m-semihosting = { version = "0.5.0", optional = true }
+
+# Panic handlers
+panic-probe = { version = "1.0", optional = true, features = ["print-defmt"] }
+panic-halt = { version = "1.0", optional = true }
+panic-semihosting = { version = "0.6.0", optional = true }
+
+[profile.dev]
+opt-level = "s"
+debug = 2
+lto = false
+overflow-checks = true
+debug-assertions = true
+
+[profile.release]
+opt-level = "z"
+debug = 0
+lto = true
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+strip = "symbols"
