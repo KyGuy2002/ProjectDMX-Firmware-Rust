@@ -1,0 +1,9 @@
+{
+  "rust-analyzer.inlayHints.parameterHints.enable": true,
+  "rust-analyzer.inlayHints.typeHints.enable": false,
+  "rust-analyzer.inlayHints.chainingHints.enable": false,
+  "rust-analyzer.inlayHints.closingBraceHints.enable": false,
+  "rust-analyzer.inlayHints.lifetimeElisionHints.enable": "never",
+
+  "rust-analyzer.check.allTargets": false
+}
