@@ -47,6 +47,14 @@ bind_interrupts!(struct Irqs {
 
 const NUM_LEDS: usize = 30;
 
+
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    signal::Signal,
+};
+
+static DMX_DIMMER: Signal<CriticalSectionRawMutex, u8> = Signal::new();
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -134,53 +142,48 @@ async fn main(spawner: Spawner) {
     let mut leds = [RGB8::default(); NUM_LEDS];
 
     loop {
+        let dimmer = DMX_DIMMER.wait().await;
 
-        leds.fill(RGB8 { r: 255, g: 0, b: 0 });
+        leds.fill(RGB8 {
+            r: dimmer,
+            g: dimmer,
+            b: dimmer,
+        });
+
         ws2812.write(&leds).await;
-        Timer::after_millis(500).await;
-
-        leds.fill(RGB8 { r: 0, g: 255, b: 0 });
-        ws2812.write(&leds).await;
-        Timer::after_millis(500).await;
-
-        leds.fill(RGB8 { r: 0, g: 0, b: 255 });
-        ws2812.write(&leds).await;
-        Timer::after_millis(500).await;
-
-        leds.fill(RGB8 { r: 0, g: 0, b: 0 });
-        ws2812.write(&leds).await;
-        Timer::after_millis(500).await;
-
     }
 }
 
 #[embassy_executor::task]
 async fn dmx_rx_task(mut rx: UartRx<'static, Async>) {
     let mut frame = [0u8; 513];
+    let mut frame_count = 0u32;
 
     loop {
         match rx.read(&mut frame).await {
             Ok(_) => {
+
+
                 info!(
-                    "DMX 1-10: {} {} {} {} {} {} {} {} {} {}",
-                    frame[1],
-                    frame[2],
-                    frame[3],
-                    frame[4],
-                    frame[5],
-                    frame[6],
-                    frame[7],
-                    frame[8],
-                    frame[9],
-                    frame[10],
+                    "RAW: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    frame[0], frame[1], frame[2], frame[3],
+                    frame[4], frame[5], frame[6], frame[7],
+                    frame[8], frame[9], frame[10], frame[11],
+                    frame[12], frame[13], frame[14], frame[15],
                 );
+
+
+                let ch6 = frame[10];
+                DMX_DIMMER.signal(ch6);
+
+                frame_count = frame_count.wrapping_add(1);
+
+                if frame_count % 20 == 0 {
+                    info!("DMX ch10 dimmer: {}", ch6);
+                }
             }
-            Err(embassy_rp::uart::Error::Break) => {
-                // Expected in DMX. This marks start of frame.
-            }
-            Err(embassy_rp::uart::Error::Framing) => {
-                // Also expected around DMX break timing. Ignore.
-            }
+            Err(embassy_rp::uart::Error::Break) => {}
+            Err(embassy_rp::uart::Error::Framing) => {}
             Err(e) => {
                 warn!("DMX read error: {:?}", e);
             }
