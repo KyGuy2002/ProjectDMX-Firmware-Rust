@@ -1160,6 +1160,7 @@ dependencies = [
  "panic-halt",
  "panic-probe",
  "panic-semihosting",
+ "smart-leds",
  "ssd1306",
  "static_cell",
  "statig",
