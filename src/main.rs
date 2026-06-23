@@ -139,7 +139,7 @@ async fn main(spawner: Spawner) {
     loop {
         neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 5, 13);
         neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 30, 14);
-        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 54, 13);
+        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 55, 13);
 
         ws2812.write(&leds).await;
 
