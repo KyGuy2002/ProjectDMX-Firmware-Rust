@@ -41,7 +41,7 @@ use embassy_sync::{
     signal::Signal,
 };
 
-const NUM_LEDS: usize = 16; // change this to your LED count
+const NUM_LEDS: usize = 100;
 
 static DMX_DIMMER: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 
@@ -137,7 +137,9 @@ async fn main(spawner: Spawner) {
     let mut offset: u8 = 0;
 
     loop {
-        neo_effects::rainbow(&mut leds, offset);
+        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 5, 13);
+        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 30, 14);
+        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 54, 13);
 
         ws2812.write(&leds).await;
 
