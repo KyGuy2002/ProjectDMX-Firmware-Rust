@@ -8,7 +8,7 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 use embassy_executor::Spawner;
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer};
 
 // OLED
 use embedded_graphics::{
@@ -33,30 +33,22 @@ use static_cell::StaticCell;
 
 // DMX / UART
 use embassy_rp::uart::{
-    Async,
-    Config as UartConfig,
-    DataBits,
-    Parity,
-    StopBits,
-    Uart,
-    UartRx,
+    Async, Config as UartConfig, DataBits, Parity, StopBits, Uart, UartRx,
 };
-
-bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => InterruptHandler<PIO0>;
-    UART1_IRQ => embassy_rp::uart::InterruptHandler<UART1>;
-});
-
-let mut offset: u8 = 0;
-let mut data = [RGB8::default(); NUM_LEDS];
-
 
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
     signal::Signal,
 };
 
+const NUM_LEDS: usize = 16; // change this to your LED count
+
 static DMX_DIMMER: Signal<CriticalSectionRawMutex, u8> = Signal::new();
+
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+    UART1_IRQ => embassy_rp::uart::InterruptHandler<UART1>;
+});
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -66,7 +58,6 @@ async fn main(spawner: Spawner) {
     let _rs485_enable = Output::new(p.PIN_23, Level::Low);
 
     // DMX UART: 250000 baud, 8N2.
-    // UART1 TX = GPIO24, UART1 RX = GPIO25.
     let mut dmx_uart_cfg = UartConfig::default();
     dmx_uart_cfg.baudrate = 250_000;
     dmx_uart_cfg.data_bits = DataBits::DataBits8;
@@ -75,8 +66,8 @@ async fn main(spawner: Spawner) {
 
     let dmx_uart = Uart::new(
         p.UART1,
-        p.PIN_24,      // UART1 TX, unused
-        p.PIN_25,      // UART1 RX from RS-485 RO
+        p.PIN_24, // UART1 TX, unused
+        p.PIN_25, // UART1 RX
         Irqs,
         p.DMA_CH1,
         p.DMA_CH2,
@@ -143,24 +134,16 @@ async fn main(spawner: Spawner) {
     );
 
     let mut leds = [RGB8::default(); NUM_LEDS];
+    let mut offset: u8 = 0;
 
     loop {
-        // let dimmer = DMX_DIMMER.wait().await;
+        neo_effects::rainbow(&mut leds, offset);
 
-        for i in 0..NUM_LEDS {
-            let color_index =
-                ((i * 256 / NUM_LEDS) as u8).wrapping_add(offset);
-
-            data[i] = wheel(color_index);
-        }
-
-        leds.write(data.iter().copied()).unwrap();
+        ws2812.write(&leds).await;
 
         offset = offset.wrapping_add(1);
 
-        Timer::after(Duration::from_millis(20)).await
-
-        ws2812.write(&leds).await;
+        Timer::after(Duration::from_millis(20)).await;
     }
 }
 
@@ -172,8 +155,6 @@ async fn dmx_rx_task(mut rx: UartRx<'static, Async>) {
     loop {
         match rx.read(&mut frame).await {
             Ok(_) => {
-
-
                 info!(
                     "RAW: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     frame[0], frame[1], frame[2], frame[3],
@@ -182,14 +163,13 @@ async fn dmx_rx_task(mut rx: UartRx<'static, Async>) {
                     frame[12], frame[13], frame[14], frame[15],
                 );
 
-
-                let ch6 = frame[10];
-                DMX_DIMMER.signal(ch6);
+                let ch10 = frame[10];
+                DMX_DIMMER.signal(ch10);
 
                 frame_count = frame_count.wrapping_add(1);
 
                 if frame_count % 20 == 0 {
-                    info!("DMX ch10 dimmer: {}", ch6);
+                    info!("DMX ch10 dimmer: {}", ch10);
                 }
             }
             Err(embassy_rp::uart::Error::Break) => {}
