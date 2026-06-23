@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod neo_effects;
+
 use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
@@ -45,7 +47,8 @@ bind_interrupts!(struct Irqs {
     UART1_IRQ => embassy_rp::uart::InterruptHandler<UART1>;
 });
 
-const NUM_LEDS: usize = 30;
+let mut offset: u8 = 0;
+let mut data = [RGB8::default(); NUM_LEDS];
 
 
 use embassy_sync::{
@@ -142,13 +145,20 @@ async fn main(spawner: Spawner) {
     let mut leds = [RGB8::default(); NUM_LEDS];
 
     loop {
-        let dimmer = DMX_DIMMER.wait().await;
+        // let dimmer = DMX_DIMMER.wait().await;
 
-        leds.fill(RGB8 {
-            r: dimmer,
-            g: dimmer,
-            b: dimmer,
-        });
+        for i in 0..NUM_LEDS {
+            let color_index =
+                ((i * 256 / NUM_LEDS) as u8).wrapping_add(offset);
+
+            data[i] = wheel(color_index);
+        }
+
+        leds.write(data.iter().copied()).unwrap();
+
+        offset = offset.wrapping_add(1);
+
+        Timer::after(Duration::from_millis(20)).await
 
         ws2812.write(&leds).await;
     }
