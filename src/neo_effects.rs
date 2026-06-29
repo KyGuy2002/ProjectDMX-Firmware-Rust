@@ -149,28 +149,44 @@ pub fn apply_top_effect(
             }
         }
 
-        // 7: Segmented Letter Flash Strobe (Slower baseline with Fade option)
+        // 7: Segmented Letter Flash Strobe (Strict single-letter activation with black gaps)
         7 => {
-            let fade_threshold = 50u8;
-            let slow_tick = frame_counter >> 3; 
-            let pseudo_rand = (meta.letter_id as u8).wrapping_mul(79).wrapping_add(slow_tick);
-            let is_on = (pseudo_rand % 3) == 0;
+            // 1. Slow down the clock tick so a full cycle (letter + black space) feels smooth
+            let ultra_slow_tick = frame_counter / 16;
 
-            if is_on {
-                bg_color
-            } else if params.speed < fade_threshold {
-                let alpha = (params.speed as i32 * 256) / fade_threshold as i32;
-                blend_rgb(RGB8::default(), bg_color, alpha as u16)
+            // 2. Derive a stable random letter choice based on the current tick step
+            let mut seed = (ultra_slow_tick as u32).wrapping_add(1013904223);
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let random_val = (seed >> 16) as u16;
+            let target_letter = (random_val % 6) as u8;
+
+            // 3. Match against the pixel's letter attribution
+            let is_match = meta.letter_id == target_letter as usize;
+
+            // 4. Force a blackout gap between changes using the sub-frame tick timing.
+            // (frame_counter / 8) tracks twice as fast as ultra_slow_tick.
+            // If it's odd, we drop into a mandatory black space interval.
+            let is_blackout_interval = ((frame_counter / 8) % 2) != 0;
+
+            // 5. Higher speed slider safety pad to add extra blank spacing if desired
+            let force_dark = if params.speed > 120 {
+                (ultra_slow_tick % 3) == 0 
             } else {
-                RGB8::default() 
+                false
+            };
+
+            if is_match && !is_blackout_interval && !force_dark {
+                bg_color
+            } else {
+                RGB8::default()
             }
         }
 
-        // 8: Out-to-In Letter Sweep (U & 0 -> S & 5 -> A & 2)
-        // 9: In-to-Out Letter Sweep (A & 2 -> S & 5 -> U & 0)
+        // 8: Out-to-In Letter Sweep
+        // 9: In-to-Out Letter Sweep
         8 | 9 => {
             let fade_threshold = 50u8;
-            let step = frame_counter / 86; 
+            let step = frame_counter / 86; // 0, 1, or 2
 
             let is_targeted = match id {
                 8 => match step {
@@ -192,13 +208,29 @@ pub fn apply_top_effect(
                 b: ((bg_color.b as u16 * 25) >> 8) as u8,
             };
 
-            if is_targeted {
-                bg_color 
-            } else if params.speed < fade_threshold {
-                let alpha = (params.speed as i32 * 256) / fade_threshold as i32;
-                blend_rgb(dimmed_bg, bg_color, alpha as u16)
+            if params.speed < fade_threshold {
+                if is_targeted {
+                    let intra_step = (frame_counter % 86) as i32; // 0 to 85
+                    
+                    // --- EXTENDED SMOOTH FADE WINDOW ---
+                    // Fade in over first 25 ticks, hold solid bright, fade out over last 25 ticks
+                    let time_fade = if intra_step < 25 {
+                        (intra_step * 256) / 25 
+                    } else if intra_step > 61 {
+                        ((86 - intra_step) * 256) / 25 
+                    } else {
+                        256 // Holds solid max brightness for 36 frames
+                    };
+
+                    let speed_scalar = (fade_threshold as i32 - params.speed as i32) * 256 / fade_threshold as i32;
+                    let alpha = ((time_fade * speed_scalar) >> 8).clamp(0, 255);
+
+                    blend_rgb(dimmed_bg, bg_color, alpha as u16)
+                } else {
+                    dimmed_bg
+                }
             } else {
-                dimmed_bg 
+                if is_targeted { bg_color } else { dimmed_bg }
             }
         }
 

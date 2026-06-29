@@ -124,7 +124,7 @@ async fn main(spawner: Spawner) {
                 for i in 0..NUM_LEDS {
                     let meta = &layout_table[i];
                     let base_color = neo_effects::render_base_effect(active_params.base_effect_id, base_offset, &active_params, meta);
-                    leds_output[i] = neo_effects::apply_top_effect(active_params.top_effect_id, top_offset, base_color, meta);
+                    leds_output[i] = neo_effects::apply_top_effect(active_params.top_effect_id, top_offset, base_color, meta, &active_params);
                 }
             }
             TransitionState::Crossfading { old_params, ref mut progress, duration } => {
@@ -134,13 +134,13 @@ async fn main(spawner: Spawner) {
                 for i in 0..NUM_LEDS {
                     let meta = &layout_table[i];
 
-                    // Process history/source track frame values
+                    // Process history/source track frame values passing old_params
                     let old_base = neo_effects::render_base_effect(old_params.base_effect_id, base_offset, &old_params, meta);
-                    let old_composite = neo_effects::apply_top_effect(old_params.top_effect_id, top_offset, old_base, meta);
+                    let old_composite = neo_effects::apply_top_effect(old_params.top_effect_id, top_offset, old_base, meta, &old_params);
 
-                    // Process target frame destination parameters
+                    // Process target frame destination parameters passing active_params
                     let new_base = neo_effects::render_base_effect(active_params.base_effect_id, base_offset, &active_params, meta);
-                    let new_composite = neo_effects::apply_top_effect(active_params.top_effect_id, top_offset, new_base, meta);
+                    let new_composite = neo_effects::apply_top_effect(active_params.top_effect_id, top_offset, new_base, meta, &active_params);
 
                     // Mix frames into hardware output cleanly
                     leds_output[i] = neo_effects::blend_rgb(old_composite, new_composite, alpha);
