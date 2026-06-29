@@ -120,30 +120,54 @@ async fn main(spawner: Spawner) {
 
         match transition {
             TransitionState::Stable => {
-                // Single-pass inline processing
+                // Grab master brightness ceiling directly from the active DMX parameter profile
+                let master_intensity = active_params.r.max(active_params.g).max(active_params.b) as u32;
+
                 for i in 0..NUM_LEDS {
                     let meta = &layout_table[i];
                     let base_color = neo_effects::render_base_effect(active_params.base_effect_id, base_offset, &active_params, meta);
-                    leds_output[i] = neo_effects::apply_top_effect(active_params.top_effect_id, top_offset, base_color, meta, &active_params);
+                    let mixed_color = neo_effects::apply_top_effect(active_params.top_effect_id, top_offset, base_color, meta, &active_params);
+
+                    if master_intensity > 0 {
+                        leds_output[i] = RGB8 {
+                            r: ((mixed_color.r as u32 * master_intensity) / 255) as u8,
+                            g: ((mixed_color.g as u32 * master_intensity) / 255) as u8,
+                            b: ((mixed_color.b as u32 * master_intensity) / 255) as u8,
+                        };
+                    } else {
+                        leds_output[i] = RGB8::default();
+                    }
                 }
             }
             TransitionState::Crossfading { old_params, ref mut progress, duration } => {
                 *progress += 1;
                 let alpha = ((*progress as u16) * 256) / (duration as u16);
 
+                // Dynamically interpolate the master intensity ceiling during a crossfade
+                let old_intensity = old_params.r.max(old_params.g).max(old_params.b) as u32;
+                let new_intensity = active_params.r.max(active_params.g).max(active_params.b) as u32;
+                let master_intensity = ((old_intensity * (256 - alpha as u32)) + (new_intensity * alpha as u32)) >> 8;
+
                 for i in 0..NUM_LEDS {
                     let meta = &layout_table[i];
 
-                    // Process history/source track frame values passing old_params
                     let old_base = neo_effects::render_base_effect(old_params.base_effect_id, base_offset, &old_params, meta);
                     let old_composite = neo_effects::apply_top_effect(old_params.top_effect_id, top_offset, old_base, meta, &old_params);
 
-                    // Process target frame destination parameters passing active_params
                     let new_base = neo_effects::render_base_effect(active_params.base_effect_id, base_offset, &active_params, meta);
                     let new_composite = neo_effects::apply_top_effect(active_params.top_effect_id, top_offset, new_base, meta, &active_params);
 
-                    // Mix frames into hardware output cleanly
-                    leds_output[i] = neo_effects::blend_rgb(old_composite, new_composite, alpha);
+                    let mixed_color = neo_effects::blend_rgb(old_composite, new_composite, alpha);
+
+                    if master_intensity > 0 {
+                        leds_output[i] = RGB8 {
+                            r: ((mixed_color.r as u32 * master_intensity) / 255) as u8,
+                            g: ((mixed_color.g as u32 * master_intensity) / 255) as u8,
+                            b: ((mixed_color.b as u32 * master_intensity) / 255) as u8,
+                        };
+                    } else {
+                        leds_output[i] = RGB8::default();
+                    }
                 }
 
                 if *progress >= duration {
