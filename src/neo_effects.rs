@@ -96,12 +96,15 @@ pub fn apply_top_effect(
     // -------------------------------------------------------------
     let dim_percentage: u16 = 5; // 5 = 5% baseline glow
     
-    // Dedicated spatial variables for shape customisation
-    let horiz_beam_width: i32 = 4;
-    let horiz_fade_range: i32 = 5;
+    // Horizontal space constraints
+    let horiz_beam_width: i32 = 25; 
+    let horiz_fade_range: i32 = 20; 
+    let horiz_min_x: i32 = -30;   // Where the bar starts (off-screen left)
+    let horiz_max_x: i32 = 285;   // Where the bar ends (off-screen right)
 
-    let vert_beam_width: i32 = 25;
-    let vert_fade_range: i32 = 20;
+    // Vertical space constraints
+    let vert_beam_width: i32 = 40;  
+    let vert_fade_range: i32 = 15;  
 
     // Unified background dim profile shared across all sweep paths
     let dimmed_bg = RGB8 {
@@ -110,7 +113,9 @@ pub fn apply_top_effect(
         b: ((bg_color.b as u16 * dim_percentage) / 100) as u8,
     };
 
-    let target_pos = (frame_counter as i32 * 340) / 255 - 45;
+    // Dynamically scale target_pos to map perfectly across your specified min/max span
+    let horiz_span = horiz_max_x - horiz_min_x;
+    let target_pos = horiz_min_x + ((frame_counter as i32 * horiz_span) / 255);
 
     match id {
         // 1..4 Horizontal panning sweeps
