@@ -66,74 +66,143 @@ pub fn render_base_effect(
             _ => RGB8::default(),
         }
 
+        // 255: Diagnostic Mode - Light a single pixel by raw index using the speed channel value
+        255 => {
+            // Use the speed parameter directly as the target pixel index
+            if meta.index == (params.speed as usize) {
+                rgb_fixed(255, 255, 255) // Solid white for the identified pixel
+            } else {
+                RGB8::default() // Turn everything else off
+            }
+        }
+
         _ => RGB8::default(),
     }
 }
 
-/// Applies modifications directly onto background arrays using spatial triggers
 pub fn apply_top_effect(
     id: u8,
-    offset: u8,
+    frame_counter: u8, 
     bg_color: RGB8,
     meta: &PixelMeta,
+    params: &DmxParams, // <-- Added this to get access to the speed channel values
 ) -> RGB8 {
     if !meta.is_valid {
         return RGB8::default();
     }
 
+    // -------------------------------------------------------------
+    // SWEEP DIMENSION CONFIGURATION
+    // -------------------------------------------------------------
+    let beam_width: i32 = 25; 
+    let fade_range: i32 = 20; 
+    let max_window = beam_width + fade_range;
+
+    let dimmed_bg = RGB8 {
+        r: bg_color.r >> 2,
+        g: bg_color.g >> 2,
+        b: bg_color.b >> 2,
+    };
+
+    let target_pos = (frame_counter as i32 * 340) / 255 - 45;
+
     match id {
         // 1..4 Horizontal panning sweeps
         1 | 2 | 3 | 4 => {
-            let x_val = meta.x;
-            let target_pos = offset; 
-            let range = 32u8; // Pulse dimension limit
+            let x_val = meta.x as i32;
 
-            let in_beam = match id {
-                1 => x_val.saturating_sub(target_pos) < range,                          // Left to Right
-                2 => (255 - x_val).saturating_sub(target_pos) < range,                  // Right to Left
-                3 => (128u8.saturating_sub(x_val)).abs_diff(target_pos) < (range / 2),   // Outer to Inner
-                4 => (x_val.abs_diff(128)).saturating_sub(target_pos) < (range / 2),    // Inner to Outer
-                _ => false,
+            let dist = match id {
+                1 => (x_val - target_pos).abs(),
+                2 => ((255 - x_val) - target_pos).abs(),
+                3 => ((128 - x_val).abs() - target_pos).abs(),
+                4 => ((x_val - 128).abs() - target_pos).abs(),
+                _ => 255,
             };
 
-            if in_beam {
-                rgb_fixed(255, 255, 255) // Bright White beam strike
+            if dist <= beam_width {
+                rgb_fixed(255, 255, 255)
+            } else if dist <= max_window {
+                let alpha = ((max_window - dist) * 256) / fade_range;
+                blend_rgb(dimmed_bg, rgb_fixed(255, 255, 255), alpha as u16)
             } else {
-                // Dim existing background by 75%
-                RGB8 { r: bg_color.r >> 2, g: bg_color.g >> 2, b: bg_color.b >> 2 }
+                dimmed_bg
             }
         }
 
         // 5..6 Vertical panning sweeps
         5 | 6 => {
-            let y_val = meta.y;
-            let target_pos = offset;
-            let range = 32u8;
+            let y_val = meta.y as i32;
 
-            let in_beam = match id {
-                5 => y_val.saturating_sub(target_pos) < range,         // Top to Bottom
-                6 => (255 - y_val).saturating_sub(target_pos) < range, // Bottom to Top
+            let dist = match id {
+                5 => (y_val - target_pos).abs(),       
+                6 => ((255 - y_val) - target_pos).abs(), 
+                _ => 255,
+            };
+
+            if dist <= beam_width {
+                rgb_fixed(255, 255, 255) 
+            } else if dist <= max_window {
+                let alpha = ((max_window - dist) * 256) / fade_range;
+                blend_rgb(dimmed_bg, rgb_fixed(255, 255, 255), alpha as u16)
+            } else {
+                dimmed_bg
+            }
+        }
+
+        // 7: Segmented Letter Flash Strobe (Slower baseline with Fade option)
+        7 => {
+            let fade_threshold = 50u8;
+            let slow_tick = frame_counter >> 3; 
+            let pseudo_rand = (meta.letter_id as u8).wrapping_mul(79).wrapping_add(slow_tick);
+            let is_on = (pseudo_rand % 3) == 0;
+
+            if is_on {
+                bg_color
+            } else if params.speed < fade_threshold {
+                let alpha = (params.speed as i32 * 256) / fade_threshold as i32;
+                blend_rgb(RGB8::default(), bg_color, alpha as u16)
+            } else {
+                RGB8::default() 
+            }
+        }
+
+        // 8: Out-to-In Letter Sweep (U & 0 -> S & 5 -> A & 2)
+        // 9: In-to-Out Letter Sweep (A & 2 -> S & 5 -> U & 0)
+        8 | 9 => {
+            let fade_threshold = 50u8;
+            let step = frame_counter / 86; 
+
+            let is_targeted = match id {
+                8 => match step {
+                    0 => meta.letter_id == 0 || meta.letter_id == 5,
+                    1 => meta.letter_id == 1 || meta.letter_id == 4,
+                    _ => meta.letter_id == 2 || meta.letter_id == 3,
+                },
+                9 => match step {
+                    0 => meta.letter_id == 2 || meta.letter_id == 3,
+                    1 => meta.letter_id == 1 || meta.letter_id == 4,
+                    _ => meta.letter_id == 0 || meta.letter_id == 5,
+                },
                 _ => false,
             };
 
-            if in_beam {
-                rgb_fixed(255, 255, 255)
+            let dimmed_bg = RGB8 {
+                r: ((bg_color.r as u16 * 25) >> 8) as u8,
+                g: ((bg_color.g as u16 * 25) >> 8) as u8,
+                b: ((bg_color.b as u16 * 25) >> 8) as u8,
+            };
+
+            if is_targeted {
+                bg_color 
+            } else if params.speed < fade_threshold {
+                let alpha = (params.speed as i32 * 256) / fade_threshold as i32;
+                blend_rgb(dimmed_bg, bg_color, alpha as u16)
             } else {
-                RGB8 { r: bg_color.r >> 2, g: bg_color.g >> 2, b: bg_color.b >> 2 }
+                dimmed_bg 
             }
         }
 
-        // 7: Segmented Letter Flash Strobe
-        7 => {
-            let pseudo_rand = (meta.letter_id as u8).wrapping_mul(79).wrapping_add(offset >> 2);
-            if (pseudo_rand % 3) == 0 {
-                bg_color // Maintain original color profile
-            } else {
-                RGB8::default() // Flash blank down
-            }
-        }
-
-        _ => bg_color, // Bypass modifier without transformations
+        _ => bg_color,
     }
 }
 

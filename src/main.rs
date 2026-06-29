@@ -112,9 +112,11 @@ async fn main(spawner: Spawner) {
             active_params = new_dmx;
         }
 
-        // Apply speed increments based on parsed values
-        base_offset = base_offset.wrapping_add(active_params.speed.clamp(1, 15));
-        top_offset = top_offset.wrapping_add(active_params.speed.clamp(1, 15));
+        // Apply speed increments only if we aren't using the slider as a static index pointer (debug mode 255)
+        if active_params.base_effect_id != 255 {
+            base_offset = base_offset.wrapping_add(active_params.speed.clamp(1, 15));
+            top_offset = top_offset.wrapping_add(active_params.speed.clamp(1, 15));
+        }
 
         match transition {
             TransitionState::Stable => {
