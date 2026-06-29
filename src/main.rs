@@ -41,7 +41,7 @@ use embassy_sync::{
     signal::Signal,
 };
 
-const NUM_LEDS: usize = 100;
+const NUM_LEDS: usize = 200;
 
 static DMX_DIMMER: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 
@@ -142,6 +142,11 @@ async fn main(spawner: Spawner) {
         neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 8, 19);
         neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 41, 18);
         neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 72, 22);
+
+        // Big 250 - chained after USA
+        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 100+8, 18);
+        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 100+43, 19);
+        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 100+77, 18);
 
         // Small USA
         // neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 5, 13);
