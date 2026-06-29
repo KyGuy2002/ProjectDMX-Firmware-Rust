@@ -85,23 +85,29 @@ pub fn apply_top_effect(
     frame_counter: u8, 
     bg_color: RGB8,
     meta: &PixelMeta,
-    params: &DmxParams, // <-- Added this to get access to the speed channel values
+    params: &DmxParams,
 ) -> RGB8 {
     if !meta.is_valid {
         return RGB8::default();
     }
 
     // -------------------------------------------------------------
-    // SWEEP DIMENSION CONFIGURATION
+    // SHARED GLOBAL EFFECT CONFIGURATION
     // -------------------------------------------------------------
-    let beam_width: i32 = 25; 
-    let fade_range: i32 = 20; 
-    let max_window = beam_width + fade_range;
+    let dim_percentage: u16 = 5; // 5 = 5% baseline glow
+    
+    // Dedicated spatial variables for shape customisation
+    let horiz_beam_width: i32 = 4;
+    let horiz_fade_range: i32 = 5;
 
+    let vert_beam_width: i32 = 25;
+    let vert_fade_range: i32 = 20;
+
+    // Unified background dim profile shared across all sweep paths
     let dimmed_bg = RGB8 {
-        r: bg_color.r >> 2,
-        g: bg_color.g >> 2,
-        b: bg_color.b >> 2,
+        r: ((bg_color.r as u16 * dim_percentage) / 100) as u8,
+        g: ((bg_color.g as u16 * dim_percentage) / 100) as u8,
+        b: ((bg_color.b as u16 * dim_percentage) / 100) as u8,
     };
 
     let target_pos = (frame_counter as i32 * 340) / 255 - 45;
@@ -110,6 +116,7 @@ pub fn apply_top_effect(
         // 1..4 Horizontal panning sweeps
         1 | 2 | 3 | 4 => {
             let x_val = meta.x as i32;
+            let max_horiz_window = horiz_beam_width + horiz_fade_range;
 
             let dist = match id {
                 1 => (x_val - target_pos).abs(),
@@ -119,19 +126,20 @@ pub fn apply_top_effect(
                 _ => 255,
             };
 
-            if dist <= beam_width {
-                rgb_fixed(255, 255, 255)
-            } else if dist <= max_window {
-                let alpha = ((max_window - dist) * 256) / fade_range;
-                blend_rgb(dimmed_bg, rgb_fixed(255, 255, 255), alpha as u16)
+            if dist <= horiz_beam_width {
+                bg_color 
+            } else if dist <= max_horiz_window {
+                let alpha = ((max_horiz_window - dist) * 256) / horiz_fade_range;
+                blend_rgb(dimmed_bg, bg_color, alpha as u16) 
             } else {
-                dimmed_bg
+                dimmed_bg 
             }
         }
 
         // 5..6 Vertical panning sweeps
         5 | 6 => {
             let y_val = meta.y as i32;
+            let max_vert_window = vert_beam_width + vert_fade_range;
 
             let dist = match id {
                 5 => (y_val - target_pos).abs(),       
@@ -139,11 +147,11 @@ pub fn apply_top_effect(
                 _ => 255,
             };
 
-            if dist <= beam_width {
-                rgb_fixed(255, 255, 255) 
-            } else if dist <= max_window {
-                let alpha = ((max_window - dist) * 256) / fade_range;
-                blend_rgb(dimmed_bg, rgb_fixed(255, 255, 255), alpha as u16)
+            if dist <= vert_beam_width {
+                bg_color 
+            } else if dist <= max_vert_window {
+                let alpha = ((max_vert_window - dist) * 256) / vert_fade_range;
+                blend_rgb(dimmed_bg, bg_color, alpha as u16)
             } else {
                 dimmed_bg
             }
@@ -151,24 +159,16 @@ pub fn apply_top_effect(
 
         // 7: Segmented Letter Flash Strobe (Strict single-letter activation with black gaps)
         7 => {
-            // 1. Slow down the clock tick so a full cycle (letter + black space) feels smooth
             let ultra_slow_tick = frame_counter / 16;
 
-            // 2. Derive a stable random letter choice based on the current tick step
             let mut seed = (ultra_slow_tick as u32).wrapping_add(1013904223);
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             let random_val = (seed >> 16) as u16;
             let target_letter = (random_val % 6) as u8;
 
-            // 3. Match against the pixel's letter attribution
             let is_match = meta.letter_id == target_letter as usize;
-
-            // 4. Force a blackout gap between changes using the sub-frame tick timing.
-            // (frame_counter / 8) tracks twice as fast as ultra_slow_tick.
-            // If it's odd, we drop into a mandatory black space interval.
             let is_blackout_interval = ((frame_counter / 8) % 2) != 0;
 
-            // 5. Higher speed slider safety pad to add extra blank spacing if desired
             let force_dark = if params.speed > 120 {
                 (ultra_slow_tick % 3) == 0 
             } else {
@@ -178,48 +178,47 @@ pub fn apply_top_effect(
             if is_match && !is_blackout_interval && !force_dark {
                 bg_color
             } else {
-                RGB8::default()
+                RGB8::default() // Strobe still drops to complete black for crispness
             }
         }
 
-        // 8: Out-to-In Letter Sweep
-        // 9: In-to-Out Letter Sweep
+        // 8: Out-to-In Letter Sweep (With end-of-cycle pause)
+        // 9: In-to-Out Letter Sweep (With end-of-cycle pause)
         8 | 9 => {
             let fade_threshold = 50u8;
-            let step = frame_counter / 86; // 0, 1, or 2
+            
+            // Slice into 4 parts of 64 frames (Total = 256). 
+            // Steps 0, 1, 2 fire letters. Step 3 acts as a full-duration pause.
+            let step = frame_counter / 64; 
 
             let is_targeted = match id {
                 8 => match step {
-                    0 => meta.letter_id == 0 || meta.letter_id == 5,
-                    1 => meta.letter_id == 1 || meta.letter_id == 4,
-                    _ => meta.letter_id == 2 || meta.letter_id == 3,
+                    0 => meta.letter_id == 0 || meta.letter_id == 5, // Outer (U & 0)
+                    1 => meta.letter_id == 1 || meta.letter_id == 4, // Middle (S & 5)
+                    2 => meta.letter_id == 2 || meta.letter_id == 3, // Inner (A & 2)
+                    _ => false, // Step 3: Complete pause. All letters stay dim.
                 },
                 9 => match step {
-                    0 => meta.letter_id == 2 || meta.letter_id == 3,
-                    1 => meta.letter_id == 1 || meta.letter_id == 4,
-                    _ => meta.letter_id == 0 || meta.letter_id == 5,
+                    0 => meta.letter_id == 2 || meta.letter_id == 3, // Inner (A & 2)
+                    1 => meta.letter_id == 1 || meta.letter_id == 4, // Middle (S & 5)
+                    2 => meta.letter_id == 0 || meta.letter_id == 5, // Outer (U & 0)
+                    _ => false, // Step 3: Complete pause. All letters stay dim.
                 },
                 _ => false,
             };
 
-            let dimmed_bg = RGB8 {
-                r: ((bg_color.r as u16 * 25) >> 8) as u8,
-                g: ((bg_color.g as u16 * 25) >> 8) as u8,
-                b: ((bg_color.b as u16 * 25) >> 8) as u8,
-            };
-
             if params.speed < fade_threshold {
                 if is_targeted {
-                    let intra_step = (frame_counter % 86) as i32; // 0 to 85
+                    // Normalize progress inside the compressed 64-tick step window
+                    let intra_step = (frame_counter % 64) as i32; 
                     
-                    // --- EXTENDED SMOOTH FADE WINDOW ---
-                    // Fade in over first 25 ticks, hold solid bright, fade out over last 25 ticks
+                    // Keep the 25-tick fade window proportional to the shorter step
                     let time_fade = if intra_step < 25 {
                         (intra_step * 256) / 25 
-                    } else if intra_step > 61 {
-                        ((86 - intra_step) * 256) / 25 
+                    } else if intra_step > 39 {
+                        ((64 - intra_step) * 256) / 25 
                     } else {
-                        256 // Holds solid max brightness for 36 frames
+                        256 // Solid hold for 14 frames in the middle
                     };
 
                     let speed_scalar = (fade_threshold as i32 - params.speed as i32) * 256 / fade_threshold as i32;
