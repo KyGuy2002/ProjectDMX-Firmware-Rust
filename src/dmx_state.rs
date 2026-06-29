@@ -3,7 +3,7 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, defmt::Format)]
 pub struct DmxParams {
     pub r: u8,
     pub g: u8,

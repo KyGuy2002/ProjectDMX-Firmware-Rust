@@ -110,6 +110,7 @@ async fn main(spawner: Spawner) {
                 };
             }
             active_params = new_dmx;
+            // println!("DMX Update: {:?}", active_params);
         }
 
         // Apply speed increments only if we aren't using the slider as a static index pointer (debug mode 255)
