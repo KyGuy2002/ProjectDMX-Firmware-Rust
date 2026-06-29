@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod config;
+mod dmx_state;
 mod neo_effects;
 
 use defmt::*;
@@ -8,22 +10,9 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Ticker};
 
-// OLED
-use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
-    pixelcolor::BinaryColor,
-    prelude::*,
-    text::{Baseline, Text},
-};
-use embassy_rp::i2c::{Config as I2cConfig, I2c};
-use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
-
-// GPIO
 use embassy_rp::gpio::{Level, Output};
-
-// NeoPixel
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::{PIO0, UART1};
 use embassy_rp::pio::{InterruptHandler, Pio};
@@ -31,24 +20,27 @@ use embassy_rp::pio_programs::ws2812::{Grb, PioWs2812, PioWs2812Program};
 use smart_leds::RGB8;
 use static_cell::StaticCell;
 
-// DMX / UART
 use embassy_rp::uart::{
     Async, Config as UartConfig, DataBits, Parity, StopBits, Uart, UartRx,
 };
 
-use embassy_sync::{
-    blocking_mutex::raw::CriticalSectionRawMutex,
-    signal::Signal,
-};
-
-const NUM_LEDS: usize = 200;
-
-static DMX_DIMMER: Signal<CriticalSectionRawMutex, u8> = Signal::new();
+use config::{get_layout_map, PixelMeta, NUM_LEDS};
+use dmx_state::{DmxParams, DMX_SIGNAL};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
     UART1_IRQ => embassy_rp::uart::InterruptHandler<UART1>;
 });
+
+/// Tracks running crossfader configurations without dynamic heap allocations.
+enum TransitionState {
+    Stable,
+    Crossfading {
+        old_params: DmxParams,
+        progress: u8,
+        duration: u8,
+    },
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -57,7 +49,7 @@ async fn main(spawner: Spawner) {
     // RS-485 transceiver enable, active-low.
     let _rs485_enable = Output::new(p.PIN_23, Level::Low);
 
-    // DMX UART: 250000 baud, 8N2.
+    // DMX UART Peripheral initialization: 250000 baud, 8N2.
     let mut dmx_uart_cfg = UartConfig::default();
     dmx_uart_cfg.baudrate = 250_000;
     dmx_uart_cfg.data_bits = DataBits::DataBits8;
@@ -66,8 +58,8 @@ async fn main(spawner: Spawner) {
 
     let dmx_uart = Uart::new(
         p.UART1,
-        p.PIN_24, // UART1 TX, unused
-        p.PIN_25, // UART1 RX
+        p.PIN_24, // Unused TX Pin allocation
+        p.PIN_25, // RX Pin input
         Irqs,
         p.DMA_CH1,
         p.DMA_CH2,
@@ -77,50 +69,8 @@ async fn main(spawner: Spawner) {
     let (_dmx_tx, dmx_rx) = dmx_uart.split();
     spawner.spawn(dmx_rx_task(dmx_rx)).unwrap();
 
-    // OLED setup
-    let mut i2c_cfg = I2cConfig::default();
-    i2c_cfg.frequency = 400_000;
-
-    let i2c = I2c::new_blocking(
-        p.I2C1,
-        p.PIN_27,
-        p.PIN_38,
-        i2c_cfg,
-    );
-
-    let interface = I2CDisplayInterface::new(i2c);
-
-    let mut display = Ssd1306::new(
-        interface,
-        DisplaySize128x64,
-        DisplayRotation::Rotate0,
-    )
-    .into_buffered_graphics_mode();
-
-    display.init().unwrap();
-
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::On)
-        .build();
-
-    Text::with_baseline(
-        "Hello RP2040!",
-        Point::new(0, 0),
-        text_style,
-        Baseline::Top,
-    )
-    .draw(&mut display)
-    .unwrap();
-
-    display.flush().unwrap();
-
-    // WS2812 / NeoPixel setup on GPIO9
-    let Pio {
-        mut common,
-        sm0,
-        ..
-    } = Pio::new(p.PIO0, Irqs);
+    // WS2812 PIO Motor Driver instantiation on GPIO9
+    let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
 
     static PROGRAM: StaticCell<PioWs2812Program<PIO0>> = StaticCell::new();
     let program = PROGRAM.init(PioWs2812Program::new(&mut common));
@@ -133,63 +83,100 @@ async fn main(spawner: Spawner) {
         program,
     );
 
-    let mut leds = [RGB8::default(); NUM_LEDS];
-    let mut offset: u8 = 0;
+    // Global pre-calculated coordinate space mapping allocation
+    let layout_table: [PixelMeta; NUM_LEDS] = get_layout_map();
+
+    let mut leds_output = [RGB8::default(); NUM_LEDS];
+
+    let mut active_params = DmxParams::default();
+    let mut transition = TransitionState::Stable;
+
+    let mut base_offset: u8 = 0;
+    let mut top_offset: u8 = 0;
+
+    let mut ticker = Ticker::every(Duration::from_millis(20)); // Clean ~50FPS Refresh rate
 
     loop {
+        // Look for a non-blocking incoming DMX update
+        if let Some(new_dmx) = DMX_SIGNAL.try_take() {
+            if new_dmx.base_effect_id != active_params.base_effect_id 
+                || new_dmx.top_effect_id != active_params.top_effect_id 
+            {
+                // Trigger a smooth crossfade over 25 frame updates
+                transition = TransitionState::Crossfading {
+                    old_params: active_params,
+                    progress: 0,
+                    duration: 25,
+                };
+            }
+            active_params = new_dmx;
+        }
 
-        // Big USA
-        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 8, 19);
-        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 41, 18);
-        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 72, 22);
+        // Apply speed increments based on parsed values
+        base_offset = base_offset.wrapping_add(active_params.speed.clamp(1, 15));
+        top_offset = top_offset.wrapping_add(active_params.speed.clamp(1, 15));
 
-        // Big 250 - chained after USA
-        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 100+8, 18);
-        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 100+43, 19);
-        neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 100+77, 18);
+        match transition {
+            TransitionState::Stable => {
+                // Single-pass inline processing
+                for i in 0..NUM_LEDS {
+                    let meta = &layout_table[i];
+                    let base_color = neo_effects::render_base_effect(active_params.base_effect_id, base_offset, &active_params, meta);
+                    leds_output[i] = neo_effects::apply_top_effect(active_params.top_effect_id, top_offset, base_color, meta);
+                }
+            }
+            TransitionState::Crossfading { old_params, ref mut progress, duration } => {
+                *progress += 1;
+                let alpha = ((*progress as u16) * 256) / (duration as u16);
 
-        // Small USA
-        // neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 5, 13);
-        // neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 30, 14);
-        // neo_effects::fourth_july::<NUM_LEDS>(&mut leds, offset, 55, 13);
+                for i in 0..NUM_LEDS {
+                    let meta = &layout_table[i];
 
-        ws2812.write(&leds).await;
+                    // Process history/source track frame values
+                    let old_base = neo_effects::render_base_effect(old_params.base_effect_id, base_offset, &old_params, meta);
+                    let old_composite = neo_effects::apply_top_effect(old_params.top_effect_id, top_offset, old_base, meta);
 
-        offset = offset.wrapping_add(1);
+                    // Process target frame destination parameters
+                    let new_base = neo_effects::render_base_effect(active_params.base_effect_id, base_offset, &active_params, meta);
+                    let new_composite = neo_effects::apply_top_effect(active_params.top_effect_id, top_offset, new_base, meta);
 
-        Timer::after(Duration::from_millis(20)).await;
+                    // Mix frames into hardware output cleanly
+                    leds_output[i] = neo_effects::blend_rgb(old_composite, new_composite, alpha);
+                }
+
+                if *progress >= duration {
+                    transition = TransitionState::Stable;
+                }
+            }
+        }
+
+        // Stream frame via DMA to PIO
+        ws2812.write(&leds_output).await;
+        ticker.next().await;
     }
 }
 
 #[embassy_executor::task]
 async fn dmx_rx_task(mut rx: UartRx<'static, Async>) {
     let mut frame = [0u8; 513];
-    let mut frame_count = 0u32;
-
     loop {
         match rx.read(&mut frame).await {
             Ok(_) => {
-                info!(
-                    "RAW: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-                    frame[0], frame[1], frame[2], frame[3],
-                    frame[4], frame[5], frame[6], frame[7],
-                    frame[8], frame[9], frame[10], frame[11],
-                    frame[12], frame[13], frame[14], frame[15],
-                );
-
-                let ch10 = frame[10];
-                DMX_DIMMER.signal(ch10);
-
-                frame_count = frame_count.wrapping_add(1);
-
-                if frame_count % 20 == 0 {
-                    info!("DMX ch10 dimmer: {}", ch10);
-                }
+                // Map your console channels directly onto DMX structural fields
+                let extracted = DmxParams {
+                    r: frame[1],
+                    g: frame[2],
+                    b: frame[3],
+                    base_effect_id: frame[4],
+                    top_effect_id: frame[5],
+                    speed: frame[6],
+                };
+                DMX_SIGNAL.signal(extracted);
             }
             Err(embassy_rp::uart::Error::Break) => {}
             Err(embassy_rp::uart::Error::Framing) => {}
             Err(e) => {
-                warn!("DMX read error: {:?}", e);
+                warn!("DMX connection drop or frame issue: {:?}", e);
             }
         }
     }
