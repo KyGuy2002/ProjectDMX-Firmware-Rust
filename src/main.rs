@@ -162,14 +162,17 @@ async fn dmx_rx_task(mut rx: UartRx<'static, Async>) {
     loop {
         match rx.read(&mut frame).await {
             Ok(_) => {
+
+                const START_CH: usize = 7;
+
                 // Map your console channels directly onto DMX structural fields
                 let extracted = DmxParams {
-                    r: frame[1],
-                    g: frame[2],
-                    b: frame[3],
-                    base_effect_id: frame[4],
-                    top_effect_id: frame[5],
-                    speed: frame[6],
+                    r: frame[START_CH + 0],
+                    g: frame[START_CH + 1],
+                    b: frame[START_CH + 2],
+                    base_effect_id: frame[START_CH + 3],
+                    top_effect_id: frame[START_CH + 4],
+                    speed: frame[START_CH + 5],
                 };
                 DMX_SIGNAL.signal(extracted);
             }

@@ -1,7 +1,7 @@
 // src/neo_effects.rs
 
 use smart_leds::RGB8;
-use crate::config::{PixelMeta, NUM_LEDS};
+use crate::config::{PixelMeta};
 use crate::dmx_state::DmxParams;
 
 /// Converts logical colors directly to physical layout mapping rules (GRB Swapped)
