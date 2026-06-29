@@ -99,12 +99,13 @@ pub fn apply_top_effect(
     // Horizontal space constraints
     let horiz_beam_width: i32 = 25; 
     let horiz_fade_range: i32 = 20; 
-    let horiz_min_x: i32 = -30;   // Where the bar starts (off-screen left)
-    let horiz_max_x: i32 = 285;   // Where the bar ends (off-screen right)
+    let horiz_min_x: i32 = 0-60;   // Where the bar starts (off-screen left)
+    let horiz_max_x: i32 = 236+60;   // Where the bar ends (off-screen right)
+    let horiz_center_x: i32 = 117;
 
     // Vertical space constraints
-    let vert_beam_width: i32 = 40;  
-    let vert_fade_range: i32 = 15;  
+    let vert_beam_width: i32 = 30;  
+    let vert_fade_range: i32 = 20;  
 
     // Unified background dim profile shared across all sweep paths
     let dimmed_bg = RGB8 {
@@ -124,10 +125,22 @@ pub fn apply_top_effect(
             let max_horiz_window = horiz_beam_width + horiz_fade_range;
 
             let dist = match id {
-                1 => (x_val - target_pos).abs(),
-                2 => ((255 - x_val) - target_pos).abs(),
-                3 => ((128 - x_val).abs() - target_pos).abs(),
-                4 => ((x_val - 128).abs() - target_pos).abs(),
+                1 => (x_val - target_pos).abs(), // Left to Right
+                2 => ((255 - x_val) - target_pos).abs(), // Right to Left
+                
+                // Outside-In Sweep (L -> Center)
+                3 => {
+                    let center_span = horiz_center_x - horiz_min_x;
+                    let split_target = horiz_min_x + ((frame_counter as i32 * center_span) / 255);
+                    ((x_val - horiz_center_x).abs() - (horiz_center_x - split_target)).abs()
+                },
+                
+                // Inside-Out Sweep (Center -> Outward to min/max edges)
+                4 => {
+                    let center_span = horiz_center_x - horiz_min_x;
+                    let split_target = horiz_min_x + ((frame_counter as i32 * center_span) / 255);
+                    ((x_val - horiz_center_x).abs() - (split_target - horiz_min_x)).abs()
+                },
                 _ => 255,
             };
 
