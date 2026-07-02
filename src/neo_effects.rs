@@ -66,10 +66,23 @@ pub fn render_base_effect(
             wheel(pos)
         }
 
-        // 3: DMX Driven Custom Color Stardust Twinkle
+        // 3: Random Custom Color Stardust Twinkle (Controlled Speed and Density)
         3 => {
-            let pseudo_rand = (meta.index as u8).wrapping_mul(37).wrapping_add(offset);
-            if pseudo_rand > 245 {
+            // --- ADJUSTABLE TUNING VARIABLES ---
+            let speed_divisor = 8;  // Higher = slower change (e.g., 4 means change color states every 4 frames)
+            let density_cutoff = 238; // Higher = fewer pixels on (238 leaves ~7% of pixels lit concurrently)
+            // -----------------------------------
+
+            // Slow down the time steps smoothly by dividing the frame offset
+            let slow_offset = (offset / speed_divisor) as u32;
+
+            // Ensure the base is always an odd number so the power cycle doesn't flatline
+            let base = (meta.index as u8).wrapping_mul(37) | 1;
+            
+            // Generate the chaotic exponential state
+            let pseudo_rand = base.wrapping_pow(slow_offset);
+            
+            if pseudo_rand > density_cutoff {
                 color1
             } else {
                 RGB8::default()
