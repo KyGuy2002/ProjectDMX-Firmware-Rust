@@ -44,7 +44,14 @@ enum TransitionState {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
+    // 1. Create a default hardware config
+    let mut config = embassy_rp::config::Config::default();
+    
+    // 2. Force the system clock to 125MHz for timing accuracy with standard PIO code
+    config.clocks = embassy_rp::clocks::ClockConfig::system_freq(125_000_000).unwrap();     
+    // 3. Initialize the RP2350 with the custom config
+    let p = embassy_rp::init(config);
+    // let p = embassy_rp::init(Default::default());
 
     // RS-485 transceiver enable, active-low.
     let _rs485_enable = Output::new(p.PIN_23, Level::Low);
@@ -79,7 +86,7 @@ async fn main(spawner: Spawner) {
         &mut common,
         sm0,
         p.DMA_CH0,
-        p.PIN_9,
+        p.PIN_15,
         program,
     );
 
@@ -190,7 +197,7 @@ async fn dmx_rx_task(mut rx: UartRx<'static, Async>) {
         match rx.read(&mut frame).await {
             Ok(_) => {
 
-                const START_CH: usize = 7;
+                const START_CH: usize = 97;
 
                 // Map your console channels directly onto DMX structural fields
                 let extracted = DmxParams {
@@ -200,6 +207,9 @@ async fn dmx_rx_task(mut rx: UartRx<'static, Async>) {
                     base_effect_id: frame[START_CH + 3],
                     top_effect_id: frame[START_CH + 4],
                     speed: frame[START_CH + 5],
+                    r2: frame[START_CH + 6],
+                    g2: frame[START_CH + 7],
+                    b2: frame[START_CH + 8],
                 };
                 DMX_SIGNAL.signal(extracted);
             }

@@ -30,7 +30,28 @@ pub fn render_base_effect(
         return RGB8::default();
     }
 
+    // Extract the primary and secondary color structs straight from incoming DMX parameters
+    let color1 = rgb_fixed(params.r, params.g, params.b);
+    let color2 = rgb_fixed(params.r2, params.g2, params.b2);
+
     match id {
+
+        // 0: Dual-Color Pinwheel (Smoothly rotates using only the 2 DMX colors)
+        0 => {
+            // Generates a revolving wave using the pixel's X/Y matrix layout footprint
+            let pixel_angle = ((meta.x as u16 * 2) + (meta.y as u16 * 2)) & 255;
+            let wave_pos = pixel_angle.wrapping_add(offset as u16) & 255;
+            
+            // Map the wave cycle position to a clean 0..255 linear blending scalar
+            let blend_factor = if wave_pos < 128 {
+                (wave_pos * 2) as u16
+            } else {
+                ((255 - wave_pos) * 2) as u16
+            };
+
+            blend_rgb(color1, color2, blend_factor)
+        }
+
         // 1: Original 4th of July continuous layout effect (re-mapped smoothly using physical coordinates)
         1 => {
             // Instead of using an external index lookup, we use your original formula's logic
@@ -49,14 +70,14 @@ pub fn render_base_effect(
         3 => {
             let pseudo_rand = (meta.index as u8).wrapping_mul(37).wrapping_add(offset);
             if pseudo_rand > 245 {
-                rgb_fixed(params.r, params.g, params.b)
+                color1
             } else {
                 RGB8::default()
             }
         }
 
         // 4: Solid static uniform color mapping
-        4 => rgb_fixed(params.r, params.g, params.b),
+        4 => color1,
 
         // 5: 4th July Static letter assignments (U=Red, S=White, A=Blue, Mirroring to 250)
         5 => match meta.letter_id {
@@ -64,6 +85,24 @@ pub fn render_base_effect(
             1 | 4 => rgb_fixed(255, 255, 255), // S and 5 -> White
             2 | 3 => rgb_fixed(0, 0, 255),     // A and 2 -> Blue
             _ => RGB8::default(),
+        },
+
+        // 6: USA vs 250 Split (USA gets Color 1, 250 gets Color 2)
+        6 => {
+            if meta.letter_id <= 2 {
+                color1 // Letters 0, 1, 2 ("U", "S", "A")
+            } else {
+                color2 // Letters 3, 4, 5 ("2", "5", "0")
+            }
+        }
+
+        // 7: Alternating Zebra Split (U, A, 5 get Color 1 | S, 2, 0 get Color 2)
+        7 => {
+            if meta.letter_id % 2 == 0 {
+                color1 // Letters 0 ("U"), 2 ("A"), 4 ("5")
+            } else {
+                color2 // Letters 1 ("S"), 3 ("2"), 5 ("0")
+            }
         }
 
         // 255: Diagnostic Mode - Light a single pixel by raw index using the speed channel value

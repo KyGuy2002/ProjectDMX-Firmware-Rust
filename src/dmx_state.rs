@@ -11,6 +11,9 @@ pub struct DmxParams {
     pub base_effect_id: u8,
     pub top_effect_id: u8,
     pub speed: u8,
+    pub r2: u8,
+    pub g2: u8,
+    pub b2: u8,
 }
 
 impl Default for DmxParams {
@@ -22,6 +25,9 @@ impl Default for DmxParams {
             base_effect_id: 1, // Default base: 4th July Wheel
             top_effect_id: 0,  // Default top: None
             speed: 5,
+            r2: 0,
+            g2: 0,
+            b2: 0,
         }
     }
 }
