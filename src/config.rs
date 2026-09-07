@@ -34,7 +34,12 @@ pub fn parse_config(jsonc: &str) -> Result<BoardInstanceConfig, ConfigError> {
     let json = strip_jsonc_comments::<MAX_CONFIG_LEN>(jsonc)?;
 
     let (config, _): (BoardInstanceConfig, usize) =
-        serde_json_core::from_str(&json).map_err(|_| ConfigError::Parse)?;
+        serde_json_core::from_str(&json).map_err(|e| {
+            // serde_json_core's error doesn't carry a line/offset, but its kind
+            // (e.g. "expected an enum variant") narrows down a bad config fast.
+            warn!("Config: JSON parse failed: {}", defmt::Debug2Format(&e));
+            ConfigError::Parse
+        })?;
 
     validate(&config)?;
 
@@ -422,7 +427,9 @@ pub enum ModuleSlot {
 enum ModuleType {
     Neo,
     Dimmer,
+    #[serde(rename = "fog")]
     FogMachine,
+    #[serde(rename = "amp")]
     AudioAmp,
     Rfid,
 }
