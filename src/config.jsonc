@@ -10,22 +10,23 @@
         "universe": 1
     },
     "audio": {
-        "universe": 2,
+        "universe": 3,
         "start_channel": 10,
         "files": ["soul.mp3", "tonight.mp3", "friends.mp3", "supernova.mp3", "spark1.mp3", "laser1.mp3", "tone.mp3"]
     },
     "modules": {
         "slot_a": {
             "type": "fog",
-            "universe": 2,
+            "universe": 3,
             "start_channel": 9
         },
 
-        // Frank Solenoids + Spirit Halloween Triggers
+
         "slot_b": {
             "type": "dimmer",
-            "universe": 2,
+            "universe": 3,
             "start_channel": 5,
+            // Frank Solenoid L, Frank Solenoid R, Hanging Corpse Trigger, Shaking Wires Trigger
             "binary": [true, true, true, true]
         },
         "slot_c": {
@@ -37,7 +38,7 @@
                     "protocol": "sk6812",
                     "color_order": "rgbw",
                     "pixel_count": 6,
-                    "universe": 3,
+                    "universe": 2,
                     "start_channel": 1,
                     "mode": "raw"
                 },
@@ -47,7 +48,7 @@
                     "protocol": "ws2812",
                     "color_order": "rgb",
                     "pixel_count": 39,
-                    "universe": 3,
+                    "universe": 2,
                     "start_channel": 31,
                     "mode": "raw"
                 },
@@ -57,7 +58,7 @@
                     "protocol": "ws2812",
                     "color_order": "grb",
                     "pixel_count": 240,
-                    "universe": 3,
+                    "universe": 2,
                     "start_channel": 200,
                     "mode": "generator2d"
                 },
@@ -67,7 +68,7 @@
                     "protocol": "ws2812",
                     "color_order": "grb",
                     "pixel_count": 240,
-                    "universe": 3,
+                    "universe": 2,
                     "start_channel": 210,
                     "mode": "generator2d"
                 }
@@ -79,7 +80,7 @@
 
         "slot_d": {
             "type": "dimmer",
-            "universe": 2,
+            "universe": 3,
             "start_channel": 1,
             // CRT Fog, CRT Solenoid, Meltdown Fog, 12v Glowing Wire
             "binary": [true, true, true, false]
