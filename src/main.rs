@@ -50,7 +50,10 @@ pub static CONFIG: OnceLock<BoardInstanceConfig> = OnceLock::new();
 
 // Global DMX buffer
 pub const MAX_UNIVERSES: usize = 4;
-pub const MAX_PIXELS: usize = 80;
+// Per-port NeoPixel buffer size. Must cover the longest strip in any config
+// (currently the 240-pixel glowing-wire runs). Sizes the neo buffers, the
+// layout table, and the PioWs2812 const generic.
+pub const MAX_PIXELS: usize = 256;
 
 pub static DMX_MATRIX: BlockingMutex<CriticalSectionRawMutex, RefCell<[[u8; 512]; MAX_UNIVERSES]>> =
     BlockingMutex::new(RefCell::new([[0u8; 512]; MAX_UNIVERSES]));
@@ -94,8 +97,9 @@ async fn main(spawner: Spawner) {
 
 
 
-    // JSONC Configuration
-    let config = load_config();
+    // JSONC Configuration. `None` = use the compiled-in config.jsonc; pass
+    // Some(sd_text) here once SD-card config loading lands.
+    let config = load_config(None);
     CONFIG.init(config.clone()).unwrap();
 
 
@@ -113,9 +117,6 @@ async fn main(spawner: Spawner) {
     let audio_spawner = AUDIO_EXECUTOR.start(interrupt::SWI_IRQ_1);
     audio_spawner.spawn(periphs::audio::audio_task(config.audio, r.audio, r.sd)).unwrap();
 
-    spawner.spawn(modules::ask433::ask433_task(r.slot_b_ask433)).unwrap(); // 433MHz receiver test
-
-
     if config.input.source == InputProtocol::Artnet || config.input.source == InputProtocol::sACN {
         let stack = periphs::eth::start_eth(&spawner, r.eth, ip_state).await; // Ethernet
         periphs::sensors::start_sensors(&spawner, r.sensors); // Sensors
@@ -132,7 +133,7 @@ async fn main(spawner: Spawner) {
 
     // Module Initialization
     // init_slot_a(&spawner, config.modules.slot_a, r.slot_a_relay);
-    // init_slot_b(&spawner, config.modules.slot_b, r.slot_b_unused);
+    init_slot_b(&spawner, config.modules.slot_b, r.slot_b_dimmer);
     init_slot_c(&spawner, config.modules.slot_c, r.slot_c_neo);
     init_slot_d(&spawner, config.modules.slot_d, r.slot_d_dimmer);
 
@@ -152,17 +153,24 @@ async fn main(spawner: Spawner) {
 
 /**
  * Reads a slice of DMX channel values from the DMX_MATRIX for a given universe and starting channel.
+ *
+ * Both `universe` (1..=MAX_UNIVERSES) and `start_channel` (1..=512) are 1-based,
+ * matching how fixtures and the JSON config are addressed. `DMX_MATRIX` is stored
+ * 0-based, so universe 1 / channel 1 is row 0 / index 0. Out-of-range requests,
+ * and any tail past channel 512, read as 0.
  */
 pub fn read_channels<const N: usize>(universe: usize, start_channel: usize) -> [u8; N] {
     DMX_MATRIX.lock(|matrix| {
         let mut dest = [0u8; N];
 
-        if universe < MAX_UNIVERSES && start_channel < 512 {
+        if (1..=MAX_UNIVERSES).contains(&universe) && (1..=512).contains(&start_channel) {
+            let universe_index = universe - 1;
+            let start_index = start_channel - 1;
             let buf = matrix.borrow();
-            let universe_row: &[u8] = &buf[universe];
+            let universe_row: &[u8] = &buf[universe_index];
 
-            let end = (start_channel + N).min(512);
-            let src_slice = &universe_row[start_channel..end];
+            let end = (start_index + N).min(512);
+            let src_slice = &universe_row[start_index..end];
 
             dest[..src_slice.len()].copy_from_slice(src_slice);
         }

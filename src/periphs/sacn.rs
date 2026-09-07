@@ -235,6 +235,9 @@ pub async fn sacn_task(stack: Stack<'static>) -> ! {
                     continue;
                 }
 
+                // sACN wire universes are 1-based (E1.31), same as the config's
+                // `universe` field, so they line up directly. DMX_MATRIX is
+                // 0-based: config universe N == sACN universe N == matrix row N-1.
                 let internal_universe = sacn.universe - 1;
 
                 // Preview packets should not drive live output.

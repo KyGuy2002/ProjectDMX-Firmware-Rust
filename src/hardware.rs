@@ -61,12 +61,15 @@ assign_resources! {
         pin3: PIN_2,
         pin4: PIN_40, // Analog
     },
-    slot_b_ask433: SlotBAsk433Resources {
-        pin1: PIN_8, // Receiver DO pin
-        pin2: PIN_6,
-        pin3: PIN_5,
-        pin4: PIN_41, // Analog
-        pio: PIO2,
+    slot_b_dimmer: SlotBDimmerResources {
+        pin1: PIN_8,  // out0 -> SLICE4 chan A
+        pin2: PIN_6,  // out1 -> SLICE3 chan A
+        pin3: PIN_5,  // out2 -> SLICE2 chan B
+        pin4: PIN_41, // out3 -> SLICE8 chan B (ADC-capable pin, driven as PWM here)
+        pwm1: PWM_SLICE4,
+        pwm2: PWM_SLICE3,
+        pwm3: PWM_SLICE2,
+        pwm4: PWM_SLICE8,
     },
     slot_c_neo: SlotCNeoResources {
         pin1: PIN_15, // 4th Output (Dead on JST and Term Modules)
@@ -102,10 +105,6 @@ bind_interrupts!(pub struct NeoIrqs {
 
 bind_interrupts!(pub struct AudioIrqs {
     PIO1_IRQ_0 => PioInterruptHandler<peripherals::PIO1>;
-});
-
-bind_interrupts!(pub struct Ask433Irqs {
-    PIO2_IRQ_0 => PioInterruptHandler<peripherals::PIO2>;
 });
 
 bind_interrupts!(pub struct OledIrqs {

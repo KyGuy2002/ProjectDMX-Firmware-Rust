@@ -17,11 +17,9 @@ const OP_OUTPUT_HI: u8 = 0x50;
 const UDP_RX_PACKET_COUNT: usize = 8;
 const UDP_RX_BUF_SIZE: usize = UDP_RX_PACKET_COUNT * 600;
 
-// Set this to the universe your pixels actually read from in firmware.
-// If your config says port_config.universe = 4, use 4.
-// If your lighting software says "Universe 4" but firmware uses zero-based,
-// this may need to be 3.
-const DEBUG_PIXEL_UNIVERSE: usize = 4;
+// Debug counter index only: a 0-based DMX_MATRIX row (so config universe N -> N-1).
+// Must be < MAX_UNIVERSES or the per-second debug block is skipped.
+const DEBUG_PIXEL_UNIVERSE: usize = 3;
 
 #[embassy_executor::task]
 pub async fn artnet_task(stack: Stack<'static>) -> ! {
@@ -68,6 +66,10 @@ pub async fn artnet_task(stack: Stack<'static>) -> ! {
                 }
 
                 let sequence = packet[12];
+                // Art-Net wire universes are 0-based, so they're already the
+                // 0-based DMX_MATRIX row index. The config's `universe` field is
+                // 1-based: config universe N == Art-Net wire universe N-1 == row N-1
+                // (Art-Net universe 0 and sACN universe 1 are the same universe).
                 let universe = u16::from_le_bytes([packet[14], packet[15]]) as usize;
                 let dmx_len = u16::from_be_bytes([packet[16], packet[17]]) as usize;
 

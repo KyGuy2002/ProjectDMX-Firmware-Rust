@@ -7,68 +7,82 @@
         "port": 6000
     },
     "dmx_output": {
-        "universe": 0
+        "universe": 1
     },
     "audio": {
-        "universe": 0,
-        "start_channel": 20,
+        "universe": 2,
+        "start_channel": 10,
         "files": ["soul.mp3", "tonight.mp3", "friends.mp3", "supernova.mp3", "spark1.mp3", "laser1.mp3", "tone.mp3"]
     },
     "modules": {
         "slot_a": {
-            "disabled": true
+            "type": "fog",
+            "universe": 2,
+            "start_channel": 9
         },
+
+        // Frank Solenoids + Spirit Halloween Triggers
         "slot_b": {
-            "disabled": true
+            "type": "dimmer",
+            "universe": 2,
+            "start_channel": 5,
+            "binary": [true, true, true, true]
         },
         "slot_c": {
             "type": "neo",
             "ports": [
 
-                // Switched Lights Puzzle
+                // Cage Lights (24v alibaba uplights)
                 {
                     "protocol": "sk6812",
                     "color_order": "rgbw",
                     "pixel_count": 6,
-                    "universe": 2,
-                    "start_channel": 0,
+                    "universe": 3,
+                    "start_channel": 1,
                     "mode": "raw"
                 },
 
-                // Glowing Wire
-                {
-                    "protocol": "ws2812",
-                    "color_order": "grb",
-                    "pixel_count": 80,
-                    "universe": 1,
-                    "start_channel": 5,
-                    "mode": "generator2d"
-                },
-
-                // Bullet Pixels (Equipment)
+                // Equipment Bullet Indicators (12v w/ adapter)
                 {
                     "protocol": "ws2812",
                     "color_order": "rgb",
-                    "pixel_count": 80,
-                    "universe": 1,
-                    "start_channel": 30,
+                    "pixel_count": 39,
+                    "universe": 3,
+                    "start_channel": 31,
                     "mode": "raw"
                 },
-                
 
-                //
+                // Glowing Wire (24v alibaba wire)
                 {
-                    "disabled": true
+                    "protocol": "ws2812",
+                    "color_order": "grb",
+                    "pixel_count": 240,
+                    "universe": 3,
+                    "start_channel": 200,
+                    "mode": "generator2d"
+                },
+
+                // Glowing Wire (24v alibaba wire)
+                {
+                    "protocol": "ws2812",
+                    "color_order": "grb",
+                    "pixel_count": 240,
+                    "universe": 3,
+                    "start_channel": 210,
+                    "mode": "generator2d"
                 }
 
                 
 
             ]
         },
+
         "slot_d": {
             "type": "dimmer",
-            "universe": 1,
-            "start_channel": 0
+            "universe": 2,
+            "start_channel": 1,
+            // CRT Fog, CRT Solenoid, Meltdown Fog, 12v Glowing Wire
+            "binary": [true, true, true, false]
         }
     }
 }

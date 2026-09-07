@@ -4,7 +4,9 @@ use heapless::{String, Vec};
 use serde::{Deserialize, Serialize};
 use serde::de::{self, Deserializer};
 
-use defmt::info;
+use defmt::{info, warn};
+
+use crate::{MAX_PIXELS, MAX_UNIVERSES};
 
 const MAX_CONFIG_LEN: usize = 10240;
 
@@ -12,17 +14,109 @@ const MAX_CONFIG_LEN: usize = 10240;
 pub const MAX_AUDIO_FILES: usize = 10;
 pub const MAX_FILENAME_LEN: usize = 24;
 
-/**
- * Loads the configuration from the embedded `config.jsonc` file and returns a `BoardInstanceConfig` struct.
- */
-pub fn load_config() -> BoardInstanceConfig {
-    let jsonc_data = include_str!("config.jsonc");
+/// Error from parsing or validating a board config document.
+#[derive(Clone, Copy, PartialEq, Debug, defmt::Format)]
+pub enum ConfigError {
+    /// Text (after comment stripping) didn't fit in `MAX_CONFIG_LEN`.
+    TooLarge,
+    /// A `/* ... */` block comment was never closed.
+    BadBlockComment,
+    /// `serde_json_core` couldn't deserialize the document.
+    Parse,
+    /// Deserialized, but a value is out of range. Payload names the field.
+    Invalid(&'static str),
+}
 
-    let json_data = strip_jsonc_comments::<MAX_CONFIG_LEN>(jsonc_data)
-        .expect("config.jsonc is too large or has a bad block comment");
+/// Comment-strips, deserializes, and validates a JSONC document. Source-agnostic
+/// so the same path serves the compiled-in string and (later) bytes read from
+/// the SD card.
+pub fn parse_config(jsonc: &str) -> Result<BoardInstanceConfig, ConfigError> {
+    let json = strip_jsonc_comments::<MAX_CONFIG_LEN>(jsonc)?;
 
-    let (config, _): (BoardInstanceConfig, usize) = serde_json_core::from_str(&json_data)
-        .expect("Failed to parse config.jsonc! Check your syntax.");
+    let (config, _): (BoardInstanceConfig, usize) =
+        serde_json_core::from_str(&json).map_err(|_| ConfigError::Parse)?;
+
+    validate(&config)?;
+
+    Ok(config)
+}
+
+/// Range checks serde can't express, so a bad config is caught at boot instead
+/// of panicking a task later (e.g. an out-of-bounds `pixel_count`).
+fn validate(config: &BoardInstanceConfig) -> Result<(), ConfigError> {
+    // Universes (1..=MAX_UNIVERSES) and channels (1..=512) are 1-based everywhere
+    // in the config, matching fixture / console addressing; `read_channels` and
+    // the DMX output loop convert to the 0-based matrix index.
+    if !(1..=MAX_UNIVERSES).contains(&(config.dmx_output.universe as usize)) {
+        return Err(ConfigError::Invalid("dmx_output universe out of range (expected 1..=MAX_UNIVERSES)"));
+    }
+    if !(1..=MAX_UNIVERSES).contains(&(config.audio.universe as usize)) {
+        return Err(ConfigError::Invalid("audio universe out of range (expected 1..=MAX_UNIVERSES)"));
+    }
+    if !(1..=512).contains(&config.audio.start_channel) {
+        return Err(ConfigError::Invalid("audio start_channel out of range (expected 1..=512)"));
+    }
+
+    let slots = [
+        &config.modules.slot_a,
+        &config.modules.slot_b,
+        &config.modules.slot_c,
+        &config.modules.slot_d,
+    ];
+
+    for slot in slots {
+        match slot {
+            ModuleSlot::Neo(neo) => {
+                for port in &neo.ports {
+                    if let Port::Enabled(p) = port {
+                        if p.pixel_count > MAX_PIXELS {
+                            return Err(ConfigError::Invalid("neo port pixel_count exceeds MAX_PIXELS"));
+                        }
+                        if !(1..=MAX_UNIVERSES).contains(&(p.universe as usize)) {
+                            return Err(ConfigError::Invalid("neo port universe out of range (expected 1..=MAX_UNIVERSES)"));
+                        }
+                        if !(1..=512).contains(&p.start_channel) {
+                            return Err(ConfigError::Invalid("neo port start_channel out of range (expected 1..=512)"));
+                        }
+                    }
+                }
+            }
+            ModuleSlot::Dimmer(d) => {
+                if !(1..=MAX_UNIVERSES).contains(&(d.universe as usize)) {
+                    return Err(ConfigError::Invalid("dimmer universe out of range (expected 1..=MAX_UNIVERSES)"));
+                }
+                if !(1..=512).contains(&d.start_channel) {
+                    return Err(ConfigError::Invalid("dimmer start_channel out of range (expected 1..=512)"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Loads the board configuration.
+///
+/// `sd_source` is the text of `config.json` read from the SD card, once that
+/// path exists; pass `None` to use the copy compiled in from `config.jsonc`. A
+/// rejected SD config falls back to the built-in one so the board always boots.
+pub fn load_config(sd_source: Option<&str>) -> BoardInstanceConfig {
+    const BUILT_IN: &str = include_str!("config.jsonc");
+
+    let config = match sd_source {
+        Some(text) => match parse_config(text) {
+            Ok(c) => {
+                info!("Config: loaded from SD card");
+                c
+            }
+            Err(e) => {
+                warn!("Config: SD card config rejected ({}), using built-in default", e);
+                parse_config(BUILT_IN).expect("built-in config.jsonc must be valid")
+            }
+        },
+        None => parse_config(BUILT_IN).expect("built-in config.jsonc must be valid"),
+    };
 
     // Print bootup information
     let input_str = match config.input.source {
@@ -47,21 +141,7 @@ pub fn load_config() -> BoardInstanceConfig {
     config
 }
 
-/**
- * For later SD card loading:
- *
- * Read the SD card config.jsonc into a &str, then call this.
- */
-pub fn parse_config_jsonc(jsonc_data: &str) -> Result<BoardInstanceConfig, ()> {
-    let json_data = strip_jsonc_comments::<MAX_CONFIG_LEN>(jsonc_data)?;
-
-    let (config, _): (BoardInstanceConfig, usize) =
-        serde_json_core::from_str(&json_data).map_err(|_| ())?;
-
-    Ok(config)
-}
-
-fn strip_jsonc_comments<const N: usize>(input: &str) -> Result<String<N>, ()> {
+fn strip_jsonc_comments<const N: usize>(input: &str) -> Result<String<N>, ConfigError> {
     let mut output = String::<N>::new();
 
     let mut chars = input.chars().peekable();
@@ -70,7 +150,7 @@ fn strip_jsonc_comments<const N: usize>(input: &str) -> Result<String<N>, ()> {
 
     while let Some(ch) = chars.next() {
         if in_string {
-            output.push(ch).map_err(|_| ())?;
+            output.push(ch).map_err(|_| ConfigError::TooLarge)?;
 
             if escaped {
                 escaped = false;
@@ -85,7 +165,7 @@ fn strip_jsonc_comments<const N: usize>(input: &str) -> Result<String<N>, ()> {
 
         if ch == '"' {
             in_string = true;
-            output.push(ch).map_err(|_| ())?;
+            output.push(ch).map_err(|_| ConfigError::TooLarge)?;
             continue;
         }
 
@@ -96,7 +176,7 @@ fn strip_jsonc_comments<const N: usize>(input: &str) -> Result<String<N>, ()> {
 
                     while let Some(comment_ch) = chars.next() {
                         if comment_ch == '\n' {
-                            output.push('\n').map_err(|_| ())?;
+                            output.push('\n').map_err(|_| ConfigError::TooLarge)?;
                             break;
                         }
                     }
@@ -120,10 +200,10 @@ fn strip_jsonc_comments<const N: usize>(input: &str) -> Result<String<N>, ()> {
                     }
 
                     if !found_end {
-                        return Err(());
+                        return Err(ConfigError::BadBlockComment);
                     }
 
-                    output.push(' ').map_err(|_| ())?;
+                    output.push(' ').map_err(|_| ConfigError::TooLarge)?;
                     continue;
                 }
 
@@ -131,7 +211,7 @@ fn strip_jsonc_comments<const N: usize>(input: &str) -> Result<String<N>, ()> {
             }
         }
 
-        output.push(ch).map_err(|_| ())?;
+        output.push(ch).map_err(|_| ConfigError::TooLarge)?;
     }
 
     Ok(output)
@@ -197,9 +277,31 @@ pub enum LedProtocol {
 #[serde(rename_all = "lowercase")]
 pub enum ColorOrder {
     Rgb,
-    Rgbw,
+    Rbg,
     Grb,
+    Gbr,
+    Brg,
+    Bgr,
+    Rgbw,
     Grbw,
+}
+
+impl ColorOrder {
+    /// Wire-order indices into a logical `[r, g, b, w]` source. Length is 3 for
+    /// an RGB strip, 4 for RGBW - this is also how the strip's bit width is
+    /// decided. Add a variant here plus one line to support another order.
+    pub fn perm(self) -> &'static [u8] {
+        match self {
+            ColorOrder::Rgb => &[0, 1, 2],
+            ColorOrder::Rbg => &[0, 2, 1],
+            ColorOrder::Grb => &[1, 0, 2],
+            ColorOrder::Gbr => &[1, 2, 0],
+            ColorOrder::Brg => &[2, 0, 1],
+            ColorOrder::Bgr => &[2, 1, 0],
+            ColorOrder::Rgbw => &[0, 1, 2, 3],
+            ColorOrder::Grbw => &[1, 0, 2, 3],
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
@@ -277,6 +379,10 @@ pub struct NeoConfig {
 pub struct DimmerConfig {
     pub universe: u16,
     pub start_channel: u16,
+    /// Per-output (out0..out3, reading `start_channel + i`): `true` = binary,
+    /// full-on above DMX 127 and off below; `false` = linear dim. Defaults to
+    /// all-linear when the `binary` key is omitted from the JSON.
+    pub binary: [bool; 4],
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
@@ -332,6 +438,7 @@ struct RawModuleSlot {
 
     universe: Option<u16>,
     start_channel: Option<u16>,
+    binary: Option<[bool; 4]>,
 }
 
 impl<'de> Deserialize<'de> for ModuleSlot {
@@ -353,6 +460,7 @@ impl<'de> Deserialize<'de> for ModuleSlot {
             ModuleType::Dimmer => Ok(ModuleSlot::Dimmer(DimmerConfig {
                 universe: raw.universe.ok_or_else(|| de::Error::missing_field("universe"))?,
                 start_channel: raw.start_channel.ok_or_else(|| de::Error::missing_field("start_channel"))?,
+                binary: raw.binary.unwrap_or([false; 4]),
             })),
 
             ModuleType::FogMachine => Ok(ModuleSlot::FogMachine(FogMachineConfig {

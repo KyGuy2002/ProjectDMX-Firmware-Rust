@@ -55,7 +55,7 @@ pub async fn dmx_task(r: DmxResources) {
 
 async fn run_dmx_input_loop(mut dmx_rx: UartRx<'static, Async>) {
     info!("        DMX Receiver Initialized       ");
-    info!("          - Writing to Universe 0      ");
+    info!("          - Writing to Universe 1      ");
     info!("");
 
     let mut frame = [0u8; 513];
@@ -81,6 +81,7 @@ async fn run_dmx_input_loop(mut dmx_rx: UartRx<'static, Async>) {
 
 async fn run_dmx_output_loop(mut dmx_tx: UartTx<'static, Async>) {
     let config = CONFIG.get().await;
+    // 1-based in config; DMX_MATRIX rows are 0-based.
     let universe_id = config.dmx_output.universe as usize;
 
     info!("      DMX Transmitter Initialized      ");
@@ -90,10 +91,10 @@ async fn run_dmx_output_loop(mut dmx_tx: UartTx<'static, Async>) {
     let mut tx_frame = [0u8; 513];
 
     loop {
-        if universe_id < MAX_UNIVERSES {
+        if (1..=MAX_UNIVERSES).contains(&universe_id) {
             DMX_MATRIX.lock(|matrix| {
                 let buf = matrix.borrow();
-                let active_matrix: &[u8] = &buf[universe_id];
+                let active_matrix: &[u8] = &buf[universe_id - 1];
 
                 tx_frame[0] = 0x00;
                 tx_frame[1..513].copy_from_slice(active_matrix);
