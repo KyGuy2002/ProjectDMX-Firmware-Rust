@@ -52,23 +52,33 @@ fn clear_i2s_underrun() {
     pac::PIO1.fdebug().write(|w| w.set_txstall(I2S_SM_MASK));
 }
 
-/// Maps a DMX value to `(file_index, looping)`:
+#[derive(Clone, Copy, PartialEq)]
+enum PlaybackMode {
+    Once,
+    Loop,
+    Both,
+}
+
+/// Maps a DMX value to `(file_index, mode)`:
 /// - `0` => `None` (stop)
-/// - `1..=127` => `(v - 1, false)` — play once
-/// - `128..=255` => `(v - 128, true)` — loop
+/// - `1..=85` => `(v - 1, Once)`
+/// - `86..=170` => `(v - 86, Loop)`
+/// - `171..=255` => `(v - 171, Both)` (route to both outputs)
 /// - resolved index past the end of the list => `None` (stop)
-fn decode_value(v: u8, num_files: usize) -> Option<(usize, bool)> {
+fn decode_value(v: u8, num_files: usize) -> Option<(usize, PlaybackMode)> {
     if v == 0 {
         return None;
     }
 
-    let (idx, looping) = if v < 128 {
-        ((v - 1) as usize, false)
+    let (idx, mode) = if v <= 85 {
+        ((v - 1) as usize, PlaybackMode::Once)
+    } else if v <= 170 {
+        ((v - 86) as usize, PlaybackMode::Loop)
     } else {
-        ((v - 128) as usize, true)
+        ((v - 171) as usize, PlaybackMode::Both)
     };
 
-    (idx < num_files).then_some((idx, looping))
+    (idx < num_files).then_some((idx, mode))
 }
 
 /// Reads the first 10 bytes of an MP3 and, if they are an ID3v2 tag header,
@@ -115,7 +125,7 @@ fn id3v2_data_start(file: &mut SdFile<'static>) -> u32 {
 
 struct Voice {
     file_index: usize,
-    looping: bool,
+    mode: PlaybackMode,
     // Offset of the first audio byte (past any ID3v2 tag). Loop-rewinds seek here
     // rather than to 0 so the tag is only ever scanned past once.
     data_start: u32,
@@ -136,7 +146,12 @@ struct Voice {
 }
 
 impl Voice {
-    fn start(handle: SdHandle, file_index: usize, looping: bool, filename: &str) -> Option<Voice> {
+    fn start(
+        handle: SdHandle,
+        file_index: usize,
+        mode: PlaybackMode,
+        filename: &str,
+    ) -> Option<Voice> {
         let mut file = match sd::open_file(handle, filename, Mode::ReadOnly) {
             Ok(f) => f,
             Err(error) => {
@@ -156,7 +171,7 @@ impl Voice {
 
         Some(Voice {
             file_index,
-            looping,
+            mode,
             data_start,
             finished: false,
             file,
@@ -187,7 +202,7 @@ impl Voice {
 
             if self.buf_len == 0 {
                 if eof {
-                    if self.looping && !rewound {
+                    if self.mode == PlaybackMode::Loop && !rewound {
                         if self.file.seek_from_start(self.data_start).is_err() {
                             return false;
                         }
@@ -283,7 +298,7 @@ impl Voice {
 /// out-of-range selection.
 fn reconcile(
     voice: &mut Option<Voice>,
-    failed_selection: &mut Option<(usize, bool)>,
+    failed_selection: &mut Option<(usize, PlaybackMode)>,
     handle: SdHandle,
     files: &[heapless::String<{ crate::config::MAX_FILENAME_LEN }>],
     dmx: u8,
@@ -293,16 +308,17 @@ fn reconcile(
             *voice = None;
             *failed_selection = None;
         }
-        Some((idx, looping)) => {
+        Some((idx, mode)) => {
             let matches = voice
                 .as_ref()
-                .is_some_and(|v| v.file_index == idx && v.looping == looping);
+            .is_some_and(|v| v.file_index == idx && v.mode == mode);
 
             if matches {
                 *failed_selection = None;
-            } else if *failed_selection != Some((idx, looping)) {
-                *voice = Voice::start(handle, idx, looping, files[idx].as_str());
-                *failed_selection = voice.is_none().then_some((idx, looping));
+            } else if *failed_selection != Some((idx, mode)) {
+                let _ = voice.take();
+                *voice = Voice::start(handle, idx, mode, files[idx].as_str());
+                *failed_selection = voice.is_none().then_some((idx, mode));
             }
         }
     }
@@ -315,8 +331,8 @@ async fn fill(
     handle: SdHandle,
     left_voice: &mut Option<Voice>,
     right_voice: &mut Option<Voice>,
-    left_failed_selection: &mut Option<(usize, bool)>,
-    right_failed_selection: &mut Option<(usize, bool)>,
+    left_failed_selection: &mut Option<(usize, PlaybackMode)>,
+    right_failed_selection: &mut Option<(usize, PlaybackMode)>,
     scratch: &mut [f32; MAX_SAMPLES_PER_FRAME],
     out: &mut [u32; OUT_BUF_LEN],
 ) {
@@ -335,6 +351,13 @@ async fn fill(
         &cfg.right_files,
         channels[1],
     );
+
+    let left_shared = left_voice
+        .as_ref()
+        .is_some_and(|voice| voice.mode == PlaybackMode::Both);
+    let right_shared = right_voice
+        .as_ref()
+        .is_some_and(|voice| voice.mode == PlaybackMode::Both);
 
     let mut pos = 0;
     while pos + MAX_FRAME_SAMPLES <= OUT_BUF_LEN {
@@ -358,6 +381,15 @@ async fn fill(
         }
 
         for i in 0..MAX_FRAME_SAMPLES {
+            let left_sample = left[i];
+            let right_sample = right[i];
+            if left_shared {
+                right[i] += left_sample;
+            }
+            if right_shared {
+                left[i] += right_sample;
+            }
+
             let left_s16 =
                 (left[i].clamp(-1.0, 1.0) * VOLUME * 32767.0) as i32 as i16 as u16;
             let right_s16 =
@@ -395,8 +427,8 @@ pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) 
 
     let mut left_voice: Option<Voice> = None;
     let mut right_voice: Option<Voice> = None;
-    let mut left_failed_selection: Option<(usize, bool)> = None;
-    let mut right_failed_selection: Option<(usize, bool)> = None;
+    let mut left_failed_selection: Option<(usize, PlaybackMode)> = None;
+    let mut right_failed_selection: Option<(usize, PlaybackMode)> = None;
     let mut scratch = [0f32; MAX_SAMPLES_PER_FRAME];
     let mut buf_a = [0u32; OUT_BUF_LEN];
     let mut buf_b = [0u32; OUT_BUF_LEN];
