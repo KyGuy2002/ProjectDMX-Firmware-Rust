@@ -72,25 +72,39 @@ enum PlaybackMode {
     Once,
     Loop,
     Both,
+    LoopBoth,
+}
+
+impl PlaybackMode {
+    fn loops(self) -> bool {
+        matches!(self, PlaybackMode::Loop | PlaybackMode::LoopBoth)
+    }
+
+    fn shared(self) -> bool {
+        matches!(self, PlaybackMode::Both | PlaybackMode::LoopBoth)
+    }
 }
 
 /// Maps a DMX value to `(file_index, mode)`:
 /// - `0` => `None` (stop)
-/// - `1..=85` => `(v - 1, Once)`
-/// - `86..=170` => `(v - 86, Loop)`
-/// - `171..=255` => `(v - 171, Both)` (route to both outputs)
+/// - `1..=64` => `(v - 1, Once)`
+/// - `65..=128` => `(v - 65, Loop)`
+/// - `129..=192` => `(v - 129, Both)` (route to both outputs)
+/// - `193..=255` => `(v - 193, LoopBoth)` (loop, routed to both outputs)
 /// - resolved index past the end of the list => `None` (stop)
 fn decode_value(v: u8, num_files: usize) -> Option<(usize, PlaybackMode)> {
     if v == 0 {
         return None;
     }
 
-    let (idx, mode) = if v <= 85 {
+    let (idx, mode) = if v <= 64 {
         ((v - 1) as usize, PlaybackMode::Once)
-    } else if v <= 170 {
-        ((v - 86) as usize, PlaybackMode::Loop)
+    } else if v <= 128 {
+        ((v - 65) as usize, PlaybackMode::Loop)
+    } else if v <= 192 {
+        ((v - 129) as usize, PlaybackMode::Both)
     } else {
-        ((v - 171) as usize, PlaybackMode::Both)
+        ((v - 193) as usize, PlaybackMode::LoopBoth)
     };
 
     (idx < num_files).then_some((idx, mode))
@@ -222,7 +236,7 @@ impl Voice {
 
             if self.buf_len == 0 {
                 if eof {
-                    if self.mode == PlaybackMode::Loop && !rewound {
+                    if self.mode.loops() && !rewound {
                         if self.file.seek_from_start(self.data_start).is_err() {
                             return false;
                         }
@@ -372,12 +386,8 @@ async fn fill(
         channels[1],
     );
 
-    let left_shared = left_voice
-        .as_ref()
-        .is_some_and(|voice| voice.mode == PlaybackMode::Both);
-    let right_shared = right_voice
-        .as_ref()
-        .is_some_and(|voice| voice.mode == PlaybackMode::Both);
+    let left_shared = left_voice.as_ref().is_some_and(|voice| voice.mode.shared());
+    let right_shared = right_voice.as_ref().is_some_and(|voice| voice.mode.shared());
 
     let mut pos = 0;
     while pos + MAX_FRAME_SAMPLES <= OUT_BUF_LEN {
