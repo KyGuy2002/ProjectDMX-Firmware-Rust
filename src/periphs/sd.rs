@@ -10,7 +10,10 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 use embassy_rp::gpio::{Level, Output};
 
 // For SdCard
-use embedded_sdmmc::{Error, File, Mode, RawDirectory, SdCard, SdCardError, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{
+    Error, File, LfnBuffer, Mode, RawDirectory, SdCard, SdCardError, ShortFileName, VolumeIdx,
+    VolumeManager,
+};
 
 use static_cell::StaticCell;
 
@@ -83,6 +86,23 @@ pub fn init(r: SdResources) -> SdHandle {
 
 /// Opens `name` in the SD card's root directory, read-only.
 pub fn open_file(handle: SdHandle, name: &str, mode: Mode) -> Result<SdFile<'static>, SdError> {
-    let raw_file = handle.mgr.open_file_in_dir(handle.root_dir, name, mode)?;
+    let mut lfn_storage = [0u8; 256];
+    let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
+    let mut short_name: Option<ShortFileName> = None;
+
+    handle
+        .mgr
+        .iterate_dir_lfn(handle.root_dir, &mut lfn_buffer, |entry, long_name| {
+            if long_name.is_some_and(|candidate| candidate.eq_ignore_ascii_case(name)) {
+                short_name = Some(entry.name.clone());
+            }
+        })?;
+
+    let raw_file = match short_name {
+        Some(short_name) => handle
+            .mgr
+            .open_file_in_dir(handle.root_dir, short_name, mode)?,
+        None => handle.mgr.open_file_in_dir(handle.root_dir, name, mode)?,
+    };
     Ok(raw_file.to_file(handle.mgr))
 }

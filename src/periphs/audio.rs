@@ -139,8 +139,12 @@ impl Voice {
     fn start(handle: SdHandle, file_index: usize, looping: bool, filename: &str) -> Option<Voice> {
         let mut file = match sd::open_file(handle, filename, Mode::ReadOnly) {
             Ok(f) => f,
-            Err(_) => {
-                println!("Audio: failed to open {}", filename);
+            Err(error) => {
+                println!(
+                    "Audio: failed to open {}: {:?}",
+                    filename,
+                    defmt::Debug2Format(&error)
+                );
                 return None;
             }
         };
@@ -277,50 +281,88 @@ impl Voice {
 /// when it already matches `(index, looping)` (so a finished one-shot stays
 /// silent); otherwise opens the new file, or clears the voice on `0` / an
 /// out-of-range selection.
-fn reconcile(voice: &mut Option<Voice>, handle: SdHandle, cfg: &AudioConfig, dmx: u8) {
-    match decode_value(dmx, cfg.files.len()) {
-        None => *voice = None,
+fn reconcile(
+    voice: &mut Option<Voice>,
+    failed_selection: &mut Option<(usize, bool)>,
+    handle: SdHandle,
+    files: &[heapless::String<{ crate::config::MAX_FILENAME_LEN }>],
+    dmx: u8,
+) {
+    match decode_value(dmx, files.len()) {
+        None => {
+            *voice = None;
+            *failed_selection = None;
+        }
         Some((idx, looping)) => {
             let matches = voice
                 .as_ref()
                 .is_some_and(|v| v.file_index == idx && v.looping == looping);
 
-            if !matches {
-                *voice = Voice::start(handle, idx, looping, cfg.files[idx].as_str());
+            if matches {
+                *failed_selection = None;
+            } else if *failed_selection != Some((idx, looping)) {
+                *voice = Voice::start(handle, idx, looping, files[idx].as_str());
+                *failed_selection = voice.is_none().then_some((idx, looping));
             }
         }
     }
 }
 
-/// Reads the DMX channel, reconciles the voice, and renders a full `out` buffer
-/// (silence where there is no audio). Yields once per frame.
+/// Reads both DMX channels, reconciles each voice independently, and renders a
+/// full stereo `out` buffer. Yields once per frame.
 async fn fill(
     cfg: &AudioConfig,
     handle: SdHandle,
-    voice: &mut Option<Voice>,
+    left_voice: &mut Option<Voice>,
+    right_voice: &mut Option<Voice>,
+    left_failed_selection: &mut Option<(usize, bool)>,
+    right_failed_selection: &mut Option<(usize, bool)>,
     scratch: &mut [f32; MAX_SAMPLES_PER_FRAME],
     out: &mut [u32; OUT_BUF_LEN],
 ) {
-    let dmx = read_channels::<1>(cfg.universe as usize, cfg.start_channel as usize)[0];
-    reconcile(voice, handle, cfg, dmx);
+    let channels = read_channels::<2>(cfg.universe as usize, cfg.start_channel as usize);
+    reconcile(
+        left_voice,
+        left_failed_selection,
+        handle,
+        &cfg.left_files,
+        channels[0],
+    );
+    reconcile(
+        right_voice,
+        right_failed_selection,
+        handle,
+        &cfg.right_files,
+        channels[1],
+    );
 
     let mut pos = 0;
     while pos + MAX_FRAME_SAMPLES <= OUT_BUF_LEN {
-        let mut mono = [0f32; MAX_FRAME_SAMPLES];
+        let mut left = [0f32; MAX_FRAME_SAMPLES];
+        let mut right = [0f32; MAX_FRAME_SAMPLES];
 
-        let produced = match voice {
-            Some(v) => v.produce(&mut mono, MAX_FRAME_SAMPLES, scratch),
+        let left_produced = match left_voice {
+            Some(v) => v.produce(&mut left, MAX_FRAME_SAMPLES, scratch),
             None => 0,
         };
-        for s in &mut mono[produced..] {
-            *s = 0.0;
+        for sample in &mut left[left_produced..] {
+            *sample = 0.0;
+        }
+
+        let right_produced = match right_voice {
+            Some(v) => v.produce(&mut right, MAX_FRAME_SAMPLES, scratch),
+            None => 0,
+        };
+        for sample in &mut right[right_produced..] {
+            *sample = 0.0;
         }
 
         for i in 0..MAX_FRAME_SAMPLES {
-            let s16 = (mono[i].clamp(-1.0, 1.0) * VOLUME * 32767.0) as i32 as i16 as u16;
-            // Same sample in the top (left) and bottom (right) half-words - mono
-            // on both I2S channels.
-            out[pos + i] = ((s16 as u32) << 16) | (s16 as u32);
+            let left_s16 =
+                (left[i].clamp(-1.0, 1.0) * VOLUME * 32767.0) as i32 as i16 as u16;
+            let right_s16 =
+                (right[i].clamp(-1.0, 1.0) * VOLUME * 32767.0) as i32 as i16 as u16;
+            out[pos + i] = ((left_s16 as u32) << 16) | (right_s16 as u32);
         }
 
         pos += MAX_FRAME_SAMPLES;
@@ -351,12 +393,25 @@ pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) 
         &i2s_program,
     );
 
-    let mut voice: Option<Voice> = None;
+    let mut left_voice: Option<Voice> = None;
+    let mut right_voice: Option<Voice> = None;
+    let mut left_failed_selection: Option<(usize, bool)> = None;
+    let mut right_failed_selection: Option<(usize, bool)> = None;
     let mut scratch = [0f32; MAX_SAMPLES_PER_FRAME];
     let mut buf_a = [0u32; OUT_BUF_LEN];
     let mut buf_b = [0u32; OUT_BUF_LEN];
 
-    fill(&cfg, handle, &mut voice, &mut scratch, &mut buf_a).await;
+    fill(
+        &cfg,
+        handle,
+        &mut left_voice,
+        &mut right_voice,
+        &mut left_failed_selection,
+        &mut right_failed_selection,
+        &mut scratch,
+        &mut buf_a,
+    )
+    .await;
 
     // The SM stalls continuously until the first DMA transfer feeds the FIFO;
     // clear that expected startup latch so the counter only sees real underruns.
@@ -368,7 +423,16 @@ pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) 
     loop {
         join(
             i2s.write(&buf_a[..]),
-            fill(&cfg, handle, &mut voice, &mut scratch, &mut buf_b),
+            fill(
+                &cfg,
+                handle,
+                &mut left_voice,
+                &mut right_voice,
+                &mut left_failed_selection,
+                &mut right_failed_selection,
+                &mut scratch,
+                &mut buf_b,
+            ),
         )
         .await;
         if i2s_underran() {
@@ -378,7 +442,16 @@ pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) 
 
         join(
             i2s.write(&buf_b[..]),
-            fill(&cfg, handle, &mut voice, &mut scratch, &mut buf_a),
+            fill(
+                &cfg,
+                handle,
+                &mut left_voice,
+                &mut right_voice,
+                &mut left_failed_selection,
+                &mut right_failed_selection,
+                &mut scratch,
+                &mut buf_a,
+            ),
         )
         .await;
         if i2s_underran() {

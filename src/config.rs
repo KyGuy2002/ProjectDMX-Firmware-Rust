@@ -12,7 +12,7 @@ const MAX_CONFIG_LEN: usize = 10240;
 
 
 pub const MAX_AUDIO_FILES: usize = 10;
-pub const MAX_FILENAME_LEN: usize = 24;
+pub const MAX_FILENAME_LEN: usize = 128;
 
 /// Error from parsing or validating a board config document.
 #[derive(Clone, Copy, PartialEq, Debug, defmt::Format)]
@@ -60,6 +60,9 @@ fn validate(config: &BoardInstanceConfig) -> Result<(), ConfigError> {
     }
     if !(1..=512).contains(&config.audio.start_channel) {
         return Err(ConfigError::Invalid("audio start_channel out of range (expected 1..=512)"));
+    }
+    if config.audio.start_channel >= 512 {
+        return Err(ConfigError::Invalid("audio right channel is out of range (expected start_channel < 512)"));
     }
 
     let slots = [
@@ -264,7 +267,8 @@ pub struct DmxOutputConfig {
 pub struct AudioConfig {
     pub universe: u16,
     pub start_channel: u16,
-    pub files: Vec<String<MAX_FILENAME_LEN>, MAX_AUDIO_FILES>,
+    pub left_files: Vec<String<MAX_FILENAME_LEN>, MAX_AUDIO_FILES>,
+    pub right_files: Vec<String<MAX_FILENAME_LEN>, MAX_AUDIO_FILES>,
 }
 
 // =========================================================================
