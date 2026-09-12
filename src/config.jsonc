@@ -12,7 +12,8 @@
     "audio": {
         "universe": 3,
         "start_channel": 10,
-        "files": ["soul.mp3", "tonight.mp3", "friends.mp3", "supernova.mp3", "spark1.mp3", "laser1.mp3", "tone.mp3"]
+        "left_files": ["idle-bg-2026.mp3"],
+        "right_files": ["idle-frank-2026.mp3", "startup-frank-2026.mp3"]
     },
     "modules": {
         "slot_a": {
