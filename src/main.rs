@@ -19,15 +19,18 @@ mod periphs {
     pub mod sensors;
     pub mod tcp_cmds;
     pub mod sd;
+    pub mod sd_stream;
     pub mod audio;
 }
 
 use core::cell::RefCell;
 use core::future::pending;
+use core::ptr::addr_of_mut;
 
-use embassy_executor::{InterruptExecutor, Spawner};
+use embassy_executor::{Executor, InterruptExecutor, Spawner};
 use embassy_rp::interrupt;
 use embassy_rp::interrupt::{InterruptExt, Priority};
+use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::mutex::Mutex as AsyncMutex;
@@ -73,6 +76,14 @@ unsafe fn SWI_IRQ_1() {
     unsafe { AUDIO_EXECUTOR.on_interrupt() };
 }
 
+// Core1 does nothing but own the SD card: it waits for a (filename, loop?)
+// selection from each audio voice and streams raw file bytes back over
+// `periphs::sd_stream`'s channels. The blocking SPI reads that used to run
+// inside the P3 audio ISR on core0 (stalling DMX/dimmer/OLED/neo for their
+// duration) now happen entirely on core1, where they can't preempt anything.
+static mut CORE1_STACK: Stack<16384> = Stack::new();
+static CORE1_EXECUTOR: StaticCell<Executor> = StaticCell::new();
+
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -109,13 +120,48 @@ async fn main(spawner: Spawner) {
     spawner.spawn(periphs::oled::oled_task(r.oled, ip_state)).unwrap(); // OLED
     spawner.spawn(periphs::dmx::dmx_task(r.dmx)).unwrap(); // DMX
 
+    // SD card + MP3 file reading live entirely on core1: those SPI reads used
+    // to run inline inside the P3 audio ISR on core0, blocking DMX/dimmer/OLED/
+    // neo for however long each read took. Core1 mounts the card itself (its
+    // VolumeManager holds a RefCell - not Send - so the handle must never
+    // leave the executor it's used on) and streams raw file bytes back to
+    // core0's decoder over `periphs::sd_stream`'s per-voice channels.
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *addr_of_mut!(CORE1_STACK) },
+        move || {
+            let executor1 = CORE1_EXECUTOR.init(Executor::new());
+            executor1.run(|spawner| {
+                let handle = periphs::sd::init(r.sd);
+                spawner
+                    .spawn(periphs::sd_stream::sd_voice_task(
+                        handle,
+                        &periphs::sd_stream::LEFT_CHANNEL,
+                    ))
+                    .unwrap();
+                spawner
+                    .spawn(periphs::sd_stream::sd_voice_task(
+                        handle,
+                        &periphs::sd_stream::RIGHT_CHANNEL,
+                    ))
+                    .unwrap();
+            });
+        },
+    );
+
     // DMX-triggered audio playback - on a dedicated high-priority interrupt
-    // executor so decode/DMA servicing preempts the thread-mode tasks. The SD
-    // card is mounted inside the task: its VolumeManager holds a RefCell (not
-    // Send), so the handle must never leave the executor it's used on.
+    // executor so decode/DMA servicing preempts the thread-mode tasks. It only
+    // ever sees raw bytes handed to it from core1 - never the SD card itself.
     interrupt::SWI_IRQ_1.set_priority(Priority::P3);
     let audio_spawner = AUDIO_EXECUTOR.start(interrupt::SWI_IRQ_1);
-    audio_spawner.spawn(periphs::audio::audio_task(config.audio, r.audio, r.sd)).unwrap();
+    audio_spawner
+        .spawn(periphs::audio::audio_task(
+            config.audio,
+            r.audio,
+            &periphs::sd_stream::LEFT_CHANNEL,
+            &periphs::sd_stream::RIGHT_CHANNEL,
+        ))
+        .unwrap();
 
     if config.input.source == InputProtocol::Artnet || config.input.source == InputProtocol::sACN {
         let stack = periphs::eth::start_eth(&spawner, r.eth, ip_state).await; // Ethernet

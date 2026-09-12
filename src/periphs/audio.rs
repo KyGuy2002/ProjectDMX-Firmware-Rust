@@ -6,12 +6,11 @@ use embassy_rp::pac;
 use embassy_rp::pio::Pio;
 use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
 use embassy_time::Instant;
-use embedded_sdmmc::Mode;
 use nanomp3::{Decoder, MAX_SAMPLES_PER_FRAME};
 
 use crate::config::AudioConfig;
-use crate::hardware::{AudioIrqs, AudioResources, SdResources};
-use crate::periphs::sd::{self, SdFile, SdHandle};
+use crate::hardware::{AudioIrqs, AudioResources};
+use crate::periphs::sd_stream::{StreamEvent, VoiceChannel, SD_CHUNK_SIZE};
 use crate::read_channels;
 
 // All source MP3s are expected at this rate - no resampling is done.
@@ -24,11 +23,11 @@ const VOLUME: f32 = 0.1;
 // so a mono frame is at most half that many.
 const MAX_FRAME_SAMPLES: usize = MAX_SAMPLES_PER_FRAME / 2;
 
-// Per-voice SD read buffer. Only topped up once it drops below the threshold so
-// each SD transaction pulls a worthwhile chunk. Threshold stays well above one
-// MP3 frame's worst-case (~1 KB) so decode is never starved.
+// Per-voice reassembly buffer for chunks arriving from core1's SD reader.
+// Sized with headroom for one full incoming chunk past the point decode gives
+// up and asks for more, so a chunk can never overflow it (see the `+
+// SD_CHUNK_SIZE` guard in `decode_next_frame`).
 const VOICE_MP3_BUF_SIZE: usize = 4 * 1024;
-const VOICE_MP3_BUF_REFILL_THRESHOLD: usize = 2 * 1024;
 
 // Frames per I2S DMA transfer / buffer. While one buffer plays (~FRAMES_PER_BATCH
 // * 26 ms of DMA) the other is refilled, so this is the headroom `fill()` has to
@@ -81,60 +80,26 @@ fn decode_value(v: u8, num_files: usize) -> Option<(usize, PlaybackMode)> {
     (idx < num_files).then_some((idx, mode))
 }
 
-/// Reads the first 10 bytes of an MP3 and, if they are an ID3v2 tag header,
-/// returns the byte offset where the actual audio starts. Real songs routinely
-/// carry tens of KB of ID3v2 metadata (embedded album art); seeking past it up
-/// front keeps the decoder from grinding through all of it on every file open.
-/// Returns 0 when there is no recognisable tag.
-fn id3v2_data_start(file: &mut SdFile<'static>) -> u32 {
-    let mut header = [0u8; 10];
-    let mut read = 0;
-
-    while read < header.len() {
-        match file.read(&mut header[read..]) {
-            Ok(0) => break,
-            Ok(n) => read += n,
-            Err(_) => break,
-        }
-    }
-
-    // "ID3" magic, and the 4 size bytes must be syncsafe (top bit clear).
-    let is_id3 = read == header.len()
-        && &header[..3] == b"ID3"
-        && header[6] < 0x80
-        && header[7] < 0x80
-        && header[8] < 0x80
-        && header[9] < 0x80;
-
-    if !is_id3 {
-        return 0;
-    }
-
-    let size = ((header[6] as u32) << 21)
-        | ((header[7] as u32) << 14)
-        | ((header[8] as u32) << 7)
-        | (header[9] as u32);
-
-    let mut total = 10 + size;
-    if header[5] & 0x10 != 0 {
-        total += 10; // optional footer
-    }
-
-    total
-}
-
 struct Voice {
     file_index: usize,
     mode: PlaybackMode,
-    // Offset of the first audio byte (past any ID3v2 tag). Loop-rewinds seek here
-    // rather than to 0 so the tag is only ever scanned past once.
-    data_start: u32,
-    // Set once a one-shot plays through to EOF. The voice is kept (silent) rather
-    // than dropped, so reconcile() doesn't see "nothing playing" and restart it
-    // every fill. Cleared only by selecting a different file (or 0).
+    // Set once a one-shot plays through to EOF, or its file failed to open.
+    // The voice is kept (silent) rather than dropped, so reconcile() doesn't
+    // see "nothing playing" and restart it every fill. Cleared only by
+    // selecting a different file (or 0).
     finished: bool,
+    open_failed: bool,
+    // True once core1 has reported real end-of-file for this voice's current
+    // selection (never set for Loop mode - core1 rewinds transparently).
+    eof_seen: bool,
 
-    file: SdFile<'static>,
+    // Identifies which selection this voice's channel events belong to, so a
+    // stale event from a since-replaced selection can be told apart and
+    // discarded instead of being decoded as if it were fresh data.
+    generation: u32,
+    channel: &'static VoiceChannel,
+    chunks_received: u32,
+
     decoder: Decoder,
     mp3_buf: [u8; VOICE_MP3_BUF_SIZE],
     buf_len: usize,
@@ -147,82 +112,121 @@ struct Voice {
 
 impl Voice {
     fn start(
-        handle: SdHandle,
+        channel: &'static VoiceChannel,
+        next_gen: &mut u32,
         file_index: usize,
         mode: PlaybackMode,
-        filename: &str,
-    ) -> Option<Voice> {
-        let mut file = match sd::open_file(handle, filename, Mode::ReadOnly) {
-            Ok(f) => f,
-            Err(error) => {
-                println!(
-                    "Audio: failed to open {}: {:?}",
-                    filename,
-                    defmt::Debug2Format(&error)
-                );
-                return None;
-            }
-        };
+        filename: &heapless::String<{ crate::config::MAX_FILENAME_LEN }>,
+    ) -> Voice {
+        *next_gen = next_gen.wrapping_add(1);
+        let generation = *next_gen;
 
-        let data_start = id3v2_data_start(&mut file);
-        if file.seek_from_start(data_start).is_err() {
-            let _ = file.seek_from_start(0);
-        }
+        println!(
+            "Audio: starting voice file_index={} mode={} generation={}",
+            file_index,
+            match mode {
+                PlaybackMode::Once => "once",
+                PlaybackMode::Loop => "loop",
+                PlaybackMode::Both => "both",
+            },
+            generation
+        );
 
-        Some(Voice {
+        channel
+            .selection
+            .signal(Some(crate::periphs::sd_stream::StreamSelection {
+                filename: filename.clone(),
+                loop_playback: mode == PlaybackMode::Loop,
+                generation,
+            }));
+
+        Voice {
             file_index,
             mode,
-            data_start,
             finished: false,
-            file,
+            open_failed: false,
+            eof_seen: false,
+            generation,
+            channel,
+            chunks_received: 0,
             decoder: Decoder::new(),
             mp3_buf: [0u8; VOICE_MP3_BUF_SIZE],
             buf_len: 0,
             carry: [0f32; MAX_FRAME_SAMPLES],
             carry_len: 0,
             carry_pos: 0,
-        })
+        }
     }
 
-    /// Decodes the next MP3 frame into `self.carry` as mono (downmixing a stereo
-    /// source). Loops back to the start of the file at EOF when `self.looping`.
-    /// Returns `false` once there is genuinely no more audio (one-shot EOF).
-    fn decode_next_frame(&mut self, scratch: &mut [f32; MAX_SAMPLES_PER_FRAME]) -> bool {
-        let mut eof = false;
-        let mut rewound = false;
-
+    /// Waits for the next update from core1's SD reader and applies it.
+    /// Discards events left over from a since-replaced selection (mismatched
+    /// `generation`) instead of treating them as fresh data.
+    async fn pull_more(&mut self) {
         loop {
-            if !eof && self.buf_len < VOICE_MP3_BUF_REFILL_THRESHOLD {
-                match self.file.read(&mut self.mp3_buf[self.buf_len..]) {
-                    Ok(0) => eof = true,
-                    Ok(n) => self.buf_len += n,
-                    Err(_) => eof = true,
-                }
-            }
-
-            if self.buf_len == 0 {
-                if eof {
-                    if self.mode == PlaybackMode::Loop && !rewound {
-                        if self.file.seek_from_start(self.data_start).is_err() {
-                            return false;
-                        }
-                        eof = false;
-                        rewound = true;
+            match self.channel.events.receive().await {
+                StreamEvent::Data { generation, len, buf } => {
+                    if generation != self.generation {
                         continue;
                     }
+                    self.chunks_received += 1;
+                    if self.chunks_received == 1 || self.chunks_received % 100 == 0 {
+                        println!(
+                            "Audio: generation={} received chunk #{} ({} bytes)",
+                            generation, self.chunks_received, len
+                        );
+                    }
+                    let n = len as usize;
+                    self.mp3_buf[self.buf_len..self.buf_len + n].copy_from_slice(&buf[..n]);
+                    self.buf_len += n;
+                    return;
+                }
+                StreamEvent::Eof { generation } => {
+                    if generation != self.generation {
+                        continue;
+                    }
+                    println!(
+                        "Audio: generation={} got EOF after {} chunks",
+                        generation, self.chunks_received
+                    );
+                    self.eof_seen = true;
+                    return;
+                }
+                StreamEvent::OpenFailed { generation } => {
+                    if generation != self.generation {
+                        continue;
+                    }
+                    println!("Audio: generation={} failed to open", generation);
+                    self.open_failed = true;
+                    self.eof_seen = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Decodes the next MP3 frame into `self.carry` as mono (downmixing a
+    /// stereo source). Returns `false` once there is genuinely no more audio
+    /// (one-shot EOF, or the file never opened).
+    async fn decode_next_frame(&mut self, scratch: &mut [f32; MAX_SAMPLES_PER_FRAME]) -> bool {
+        loop {
+            if self.buf_len == 0 {
+                if self.eof_seen {
                     return false;
                 }
+                self.pull_more().await;
                 continue;
             }
 
             let (mut consumed, info) = self.decoder.decode(&self.mp3_buf[..self.buf_len], scratch);
 
             if consumed == 0 && info.is_none() {
-                if eof || self.buf_len >= VOICE_MP3_BUF_SIZE {
+                // Leave room for one full incoming chunk before giving up on
+                // pulling more - see VOICE_MP3_BUF_SIZE's comment.
+                if self.eof_seen || self.buf_len + SD_CHUNK_SIZE > VOICE_MP3_BUF_SIZE {
                     // A frame header sits at offset 0 but the frame isn't complete
-                    // and no more data is coming - skip to the next sync candidate
-                    // (0xFF followed by 0xE_/0xF_) in one move rather than nudging
-                    // one byte at a time.
+                    // and no more data is coming (or the buffer's genuinely full) -
+                    // skip to the next sync candidate (0xFF followed by 0xE_/0xF_)
+                    // in one move rather than nudging one byte at a time.
                     let mut skip = 1;
                     while skip + 1 < self.buf_len
                         && !(self.mp3_buf[skip] == 0xFF && (self.mp3_buf[skip + 1] & 0xE0) == 0xE0)
@@ -231,14 +235,7 @@ impl Voice {
                     }
                     consumed = skip;
                 } else {
-                    // Decode needs more bytes than are buffered. Force a read now;
-                    // without this the loop can never make progress (no state
-                    // change, no await) and freezes the executor.
-                    match self.file.read(&mut self.mp3_buf[self.buf_len..]) {
-                        Ok(0) => eof = true,
-                        Ok(n) => self.buf_len += n,
-                        Err(_) => eof = true,
-                    }
+                    self.pull_more().await;
                     continue;
                 }
             }
@@ -268,7 +265,7 @@ impl Voice {
     /// Fills `out[..count]` with mono samples. Returns how many were actually
     /// written - `< count` (or 0) once a one-shot has ended; the caller zero-fills
     /// the remainder.
-    fn produce(
+    async fn produce(
         &mut self,
         out: &mut [f32],
         count: usize,
@@ -279,7 +276,7 @@ impl Voice {
         }
 
         for i in 0..count {
-            if self.carry_pos >= self.carry_len && !self.decode_next_frame(scratch) {
+            if self.carry_pos >= self.carry_len && !self.decode_next_frame(scratch).await {
                 self.finished = true;
                 return i;
             }
@@ -294,41 +291,56 @@ impl Voice {
 
 /// Brings `voice` in line with the current DMX value. Keeps the voice untouched
 /// when it already matches `(index, looping)` (so a finished one-shot stays
-/// silent); otherwise opens the new file, or clears the voice on `0` / an
-/// out-of-range selection.
+/// silent); otherwise starts streaming the new file, or clears the voice on
+/// `0` / an out-of-range selection.
 fn reconcile(
     voice: &mut Option<Voice>,
     failed_selection: &mut Option<(usize, PlaybackMode)>,
-    handle: SdHandle,
+    channel: &'static VoiceChannel,
+    next_gen: &mut u32,
     files: &[heapless::String<{ crate::config::MAX_FILENAME_LEN }>],
     dmx: u8,
 ) {
     match decode_value(dmx, files.len()) {
         None => {
+            if voice.is_some() {
+                channel.selection.signal(None);
+            }
             *voice = None;
             *failed_selection = None;
         }
         Some((idx, mode)) => {
             let matches = voice
                 .as_ref()
-            .is_some_and(|v| v.file_index == idx && v.mode == mode);
+                .is_some_and(|v| v.file_index == idx && v.mode == mode && !v.open_failed);
 
             if matches {
                 *failed_selection = None;
             } else if *failed_selection != Some((idx, mode)) {
-                let _ = voice.take();
-                *voice = Voice::start(handle, idx, mode, files[idx].as_str());
-                *failed_selection = voice.is_none().then_some((idx, mode));
+                *voice = Some(Voice::start(channel, next_gen, idx, mode, &files[idx]));
             }
+        }
+    }
+
+    // Once a started voice's open failure comes back (asynchronously, from
+    // core1), remember it so reconcile() doesn't immediately retry the same
+    // selection every fill() tick.
+    if let Some(v) = voice.as_ref() {
+        if v.open_failed {
+            *failed_selection = Some((v.file_index, v.mode));
         }
     }
 }
 
 /// Reads both DMX channels, reconciles each voice independently, and renders a
 /// full stereo `out` buffer. Yields once per frame.
+#[allow(clippy::too_many_arguments)]
 async fn fill(
     cfg: &AudioConfig,
-    handle: SdHandle,
+    left_channel: &'static VoiceChannel,
+    right_channel: &'static VoiceChannel,
+    left_gen: &mut u32,
+    right_gen: &mut u32,
     left_voice: &mut Option<Voice>,
     right_voice: &mut Option<Voice>,
     left_failed_selection: &mut Option<(usize, PlaybackMode)>,
@@ -340,14 +352,16 @@ async fn fill(
     reconcile(
         left_voice,
         left_failed_selection,
-        handle,
+        left_channel,
+        left_gen,
         &cfg.left_files,
         channels[0],
     );
     reconcile(
         right_voice,
         right_failed_selection,
-        handle,
+        right_channel,
+        right_gen,
         &cfg.right_files,
         channels[1],
     );
@@ -365,7 +379,7 @@ async fn fill(
         let mut right = [0f32; MAX_FRAME_SAMPLES];
 
         let left_produced = match left_voice {
-            Some(v) => v.produce(&mut left, MAX_FRAME_SAMPLES, scratch),
+            Some(v) => v.produce(&mut left, MAX_FRAME_SAMPLES, scratch).await,
             None => 0,
         };
         for sample in &mut left[left_produced..] {
@@ -373,7 +387,7 @@ async fn fill(
         }
 
         let right_produced = match right_voice {
-            Some(v) => v.produce(&mut right, MAX_FRAME_SAMPLES, scratch),
+            Some(v) => v.produce(&mut right, MAX_FRAME_SAMPLES, scratch).await,
             None => 0,
         };
         for sample in &mut right[right_produced..] {
@@ -403,12 +417,13 @@ async fn fill(
 }
 
 #[embassy_executor::task]
-pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) {
+pub async fn audio_task(
+    cfg: AudioConfig,
+    r: AudioResources,
+    left_channel: &'static VoiceChannel,
+    right_channel: &'static VoiceChannel,
+) {
     println!("Audio task started.");
-
-    // Mount here rather than in main(): the returned handle is not Send, and this
-    // task now owns the only reference to it.
-    let handle = sd::init(sd_r);
 
     let Pio { mut common, sm0, .. } = Pio::new(r.pio, AudioIrqs);
     let i2s_program = PioI2sOutProgram::new(&mut common);
@@ -429,13 +444,18 @@ pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) 
     let mut right_voice: Option<Voice> = None;
     let mut left_failed_selection: Option<(usize, PlaybackMode)> = None;
     let mut right_failed_selection: Option<(usize, PlaybackMode)> = None;
+    let mut left_gen: u32 = 0;
+    let mut right_gen: u32 = 0;
     let mut scratch = [0f32; MAX_SAMPLES_PER_FRAME];
     let mut buf_a = [0u32; OUT_BUF_LEN];
     let mut buf_b = [0u32; OUT_BUF_LEN];
 
     fill(
         &cfg,
-        handle,
+        left_channel,
+        right_channel,
+        &mut left_gen,
+        &mut right_gen,
         &mut left_voice,
         &mut right_voice,
         &mut left_failed_selection,
@@ -457,7 +477,10 @@ pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) 
             i2s.write(&buf_a[..]),
             fill(
                 &cfg,
-                handle,
+                left_channel,
+                right_channel,
+                &mut left_gen,
+                &mut right_gen,
                 &mut left_voice,
                 &mut right_voice,
                 &mut left_failed_selection,
@@ -476,7 +499,10 @@ pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) 
             i2s.write(&buf_b[..]),
             fill(
                 &cfg,
-                handle,
+                left_channel,
+                right_channel,
+                &mut left_gen,
+                &mut right_gen,
                 &mut left_voice,
                 &mut right_voice,
                 &mut left_failed_selection,
