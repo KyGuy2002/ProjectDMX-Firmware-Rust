@@ -25,9 +25,8 @@ mod periphs {
 use core::cell::RefCell;
 use core::future::pending;
 
-use embassy_executor::Spawner;
+use embassy_executor::{Executor, Spawner};
 use embassy_net::Ipv4Address;
-use embassy_rp::executor::Executor;
 use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
