@@ -12,8 +12,8 @@
     "audio": {
         "universe": 3,
         "start_channel": 10,
-        "left_files": ["idle-bg-2026.mp3"],
-        "right_files": ["idle-frank-2026.mp3", "startup-frank-2026.mp3"]
+        "left_files": ["idle-bg-2026.mp3", "overload-bg-2026.mp3"],
+        "right_files": ["idle-frank-2026.mp3", "startup-frank-2026.mp3", "overload-frank-2026.mp3"]
     },
     "modules": {
         "slot_a": {
