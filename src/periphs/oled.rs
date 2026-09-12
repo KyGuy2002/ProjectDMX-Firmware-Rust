@@ -1,6 +1,6 @@
 use embassy_rp::i2c::{self, Config};
 
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::{hardware::{OledIrqs, OledResources}, periphs::sensors::*};
@@ -95,7 +95,12 @@ pub async fn oled_task(r: OledResources, ip_state: &'static AsyncMutex<CriticalS
 
         draw_spinner(&mut display, 64, 28, frame);
 
+        let flush_start = Instant::now(); // DIAG: remove after measuring
         display.flush().unwrap();
+        let flush_ms = (Instant::now() - flush_start).as_millis(); // DIAG
+        if flush_ms > 3 {
+            defmt::println!("DIAG oled flush: {}ms", flush_ms);
+        }
 
         frame += 1;
         if frame >= 12 {

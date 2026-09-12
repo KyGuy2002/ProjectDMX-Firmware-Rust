@@ -1,13 +1,15 @@
 use defmt::println;
 
-use embassy_futures::join::join;
 use embassy_futures::yield_now;
 use embassy_rp::pac;
 use embassy_rp::pio::Pio;
 use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_time::Instant;
 use embedded_sdmmc::Mode;
 use nanomp3::{Decoder, MAX_SAMPLES_PER_FRAME};
+use static_cell::StaticCell;
 
 use crate::config::AudioConfig;
 use crate::hardware::{AudioIrqs, AudioResources, SdResources};
@@ -37,6 +39,19 @@ const VOICE_MP3_BUF_REFILL_THRESHOLD: usize = 2 * 1024;
 // to first audio is dominated by the MP3s' own silent lead-in, not this.)
 const FRAMES_PER_BATCH: usize = 8;
 const OUT_BUF_LEN: usize = MAX_FRAME_SAMPLES * FRAMES_PER_BATCH;
+
+type OutBuf = [u32; OUT_BUF_LEN];
+
+// The two output buffers are handed back and forth between the decode task and
+// the output task by transferring ownership of a `&'static mut OutBuf` through
+// these channels, rather than sharing them behind a lock - the decode task
+// gets one from EMPTY_CHANNEL, fills it, and posts it to FILLED_CHANNEL; the
+// output task does the reverse. Capacity 2 matches the total buffer count, so
+// neither channel can ever be asked to hold more in flight than exist.
+static BUF_A: StaticCell<OutBuf> = StaticCell::new();
+static BUF_B: StaticCell<OutBuf> = StaticCell::new();
+static FILLED_CHANNEL: Channel<CriticalSectionRawMutex, &'static mut OutBuf, 2> = Channel::new();
+static EMPTY_CHANNEL: Channel<CriticalSectionRawMutex, &'static mut OutBuf, 2> = Channel::new();
 
 // PIO1 SM0 drives the I2S output. Its FDEBUG.TXSTALL bit latches whenever the
 // state machine runs the TX FIFO dry waiting for the next DMA word - i.e. an
@@ -134,6 +149,10 @@ struct Voice {
     // every fill. Cleared only by selecting a different file (or 0).
     finished: bool,
 
+    // Kept so reads can go through `sd::read_yielding` (needs a handle to hand
+    // back to the caller's signature, even though the actual read goes through
+    // `file`'s own volume-manager reference).
+    handle: SdHandle,
     file: SdFile<'static>,
     decoder: Decoder,
     mp3_buf: [u8; VOICE_MP3_BUF_SIZE],
@@ -174,6 +193,7 @@ impl Voice {
             mode,
             data_start,
             finished: false,
+            handle,
             file,
             decoder: Decoder::new(),
             mp3_buf: [0u8; VOICE_MP3_BUF_SIZE],
@@ -187,13 +207,13 @@ impl Voice {
     /// Decodes the next MP3 frame into `self.carry` as mono (downmixing a stereo
     /// source). Loops back to the start of the file at EOF when `self.looping`.
     /// Returns `false` once there is genuinely no more audio (one-shot EOF).
-    fn decode_next_frame(&mut self, scratch: &mut [f32; MAX_SAMPLES_PER_FRAME]) -> bool {
+    async fn decode_next_frame(&mut self, scratch: &mut [f32; MAX_SAMPLES_PER_FRAME]) -> bool {
         let mut eof = false;
         let mut rewound = false;
 
         loop {
             if !eof && self.buf_len < VOICE_MP3_BUF_REFILL_THRESHOLD {
-                match self.file.read(&mut self.mp3_buf[self.buf_len..]) {
+                match sd::read_yielding(self.handle, &mut self.file, &mut self.mp3_buf[self.buf_len..]).await {
                     Ok(0) => eof = true,
                     Ok(n) => self.buf_len += n,
                     Err(_) => eof = true,
@@ -234,7 +254,7 @@ impl Voice {
                     // Decode needs more bytes than are buffered. Force a read now;
                     // without this the loop can never make progress (no state
                     // change, no await) and freezes the executor.
-                    match self.file.read(&mut self.mp3_buf[self.buf_len..]) {
+                    match sd::read_yielding(self.handle, &mut self.file, &mut self.mp3_buf[self.buf_len..]).await {
                         Ok(0) => eof = true,
                         Ok(n) => self.buf_len += n,
                         Err(_) => eof = true,
@@ -268,7 +288,7 @@ impl Voice {
     /// Fills `out[..count]` with mono samples. Returns how many were actually
     /// written - `< count` (or 0) once a one-shot has ended; the caller zero-fills
     /// the remainder.
-    fn produce(
+    async fn produce(
         &mut self,
         out: &mut [f32],
         count: usize,
@@ -279,7 +299,7 @@ impl Voice {
         }
 
         for i in 0..count {
-            if self.carry_pos >= self.carry_len && !self.decode_next_frame(scratch) {
+            if self.carry_pos >= self.carry_len && !self.decode_next_frame(scratch).await {
                 self.finished = true;
                 return i;
             }
@@ -365,7 +385,7 @@ async fn fill(
         let mut right = [0f32; MAX_FRAME_SAMPLES];
 
         let left_produced = match left_voice {
-            Some(v) => v.produce(&mut left, MAX_FRAME_SAMPLES, scratch),
+            Some(v) => v.produce(&mut left, MAX_FRAME_SAMPLES, scratch).await,
             None => 0,
         };
         for sample in &mut left[left_produced..] {
@@ -373,7 +393,7 @@ async fn fill(
         }
 
         let right_produced = match right_voice {
-            Some(v) => v.produce(&mut right, MAX_FRAME_SAMPLES, scratch),
+            Some(v) => v.produce(&mut right, MAX_FRAME_SAMPLES, scratch).await,
             None => 0,
         };
         for sample in &mut right[right_produced..] {
@@ -402,13 +422,59 @@ async fn fill(
     }
 }
 
+/// Decodes MP3/reads SD and posts filled buffers to `audio_output_task`. Runs
+/// on the default thread-mode executor (NOT `AUDIO_EXECUTOR`): decode and SD
+/// reads don't need interrupt priority, and running them here is what makes
+/// `sd::read_yielding`'s cooperative yields actually useful - they hand time
+/// to real sibling tasks (`neo_task`, `oled_task`, ...), which isn't possible
+/// when a task is alone on an interrupt-priority executor (see below).
 #[embassy_executor::task]
-pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) {
-    println!("Audio task started.");
+pub async fn audio_decode_task(cfg: AudioConfig, sd_r: SdResources) {
+    println!("Audio decode task started.");
 
     // Mount here rather than in main(): the returned handle is not Send, and this
     // task now owns the only reference to it.
     let handle = sd::init(sd_r);
+
+    let mut left_voice: Option<Voice> = None;
+    let mut right_voice: Option<Voice> = None;
+    let mut left_failed_selection: Option<(usize, PlaybackMode)> = None;
+    let mut right_failed_selection: Option<(usize, PlaybackMode)> = None;
+    let mut scratch = [0f32; MAX_SAMPLES_PER_FRAME];
+
+    let buf_a = BUF_A.init([0u32; OUT_BUF_LEN]);
+    let buf_b = BUF_B.init([0u32; OUT_BUF_LEN]);
+    EMPTY_CHANNEL.send(buf_a).await;
+    EMPTY_CHANNEL.send(buf_b).await;
+
+    loop {
+        let buf = EMPTY_CHANNEL.receive().await;
+        fill(
+            &cfg,
+            handle,
+            &mut left_voice,
+            &mut right_voice,
+            &mut left_failed_selection,
+            &mut right_failed_selection,
+            &mut scratch,
+            buf,
+        )
+        .await;
+        FILLED_CHANNEL.send(buf).await;
+    }
+}
+
+/// Feeds the I2S PIO/DMA output from buffers produced by `audio_decode_task`.
+/// Runs on `AUDIO_EXECUTOR`, a dedicated high-priority interrupt executor, so
+/// it preempts every thread-mode task (OLED I2C flush, NeoPixel effects, sACN
+/// parsing, ...). The I2S PIO FIFO only holds ~180us of samples between DMA
+/// transfers; any cooperative task that blocks the shared executor longer than
+/// that at a buffer boundary causes an audible underrun, so this task does
+/// nothing but wait for a full buffer and hand it to the DMA - no decode, no
+/// SD access, nothing that can run long between yields.
+#[embassy_executor::task]
+pub async fn audio_output_task(r: AudioResources) {
+    println!("Audio output task started.");
 
     let Pio { mut common, sm0, .. } = Pio::new(r.pio, AudioIrqs);
     let i2s_program = PioI2sOutProgram::new(&mut common);
@@ -425,68 +491,22 @@ pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) 
         &i2s_program,
     );
 
-    let mut left_voice: Option<Voice> = None;
-    let mut right_voice: Option<Voice> = None;
-    let mut left_failed_selection: Option<(usize, PlaybackMode)> = None;
-    let mut right_failed_selection: Option<(usize, PlaybackMode)> = None;
-    let mut scratch = [0f32; MAX_SAMPLES_PER_FRAME];
-    let mut buf_a = [0u32; OUT_BUF_LEN];
-    let mut buf_b = [0u32; OUT_BUF_LEN];
-
-    fill(
-        &cfg,
-        handle,
-        &mut left_voice,
-        &mut right_voice,
-        &mut left_failed_selection,
-        &mut right_failed_selection,
-        &mut scratch,
-        &mut buf_a,
-    )
-    .await;
-
-    // The SM stalls continuously until the first DMA transfer feeds the FIFO;
-    // clear that expected startup latch so the counter only sees real underruns.
-    clear_i2s_underrun();
+    let mut first_write = true;
     let mut underruns: u32 = 0;
     let mut reported: u32 = 0;
     let mut last_report = Instant::now();
 
     loop {
-        join(
-            i2s.write(&buf_a[..]),
-            fill(
-                &cfg,
-                handle,
-                &mut left_voice,
-                &mut right_voice,
-                &mut left_failed_selection,
-                &mut right_failed_selection,
-                &mut scratch,
-                &mut buf_b,
-            ),
-        )
-        .await;
-        if i2s_underran() {
-            underruns += 1;
-            clear_i2s_underrun();
-        }
+        let buf = FILLED_CHANNEL.receive().await;
+        i2s.write(&buf[..]).await;
 
-        join(
-            i2s.write(&buf_b[..]),
-            fill(
-                &cfg,
-                handle,
-                &mut left_voice,
-                &mut right_voice,
-                &mut left_failed_selection,
-                &mut right_failed_selection,
-                &mut scratch,
-                &mut buf_a,
-            ),
-        )
-        .await;
-        if i2s_underran() {
+        if first_write {
+            // The SM stalls continuously until the first DMA transfer feeds the
+            // FIFO; clear that expected startup latch so the counter only sees
+            // real underruns.
+            clear_i2s_underrun();
+            first_write = false;
+        } else if i2s_underran() {
             underruns += 1;
             clear_i2s_underrun();
         }
@@ -504,5 +524,7 @@ pub async fn audio_task(cfg: AudioConfig, r: AudioResources, sd_r: SdResources) 
             reported = underruns;
             last_report = now;
         }
+
+        EMPTY_CHANNEL.send(buf).await;
     }
 }

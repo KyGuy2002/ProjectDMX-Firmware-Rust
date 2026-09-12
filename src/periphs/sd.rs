@@ -3,7 +3,7 @@ use defmt::println;
 // For SPI
 use embassy_rp::spi;
 use embassy_rp::spi::Spi;
-use embassy_time::Delay;
+use embassy_time::{Delay, Instant};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
 // For CS Pin
@@ -105,4 +105,46 @@ pub fn open_file(handle: SdHandle, name: &str, mode: Mode) -> Result<SdFile<'sta
         None => handle.mgr.open_file_in_dir(handle.root_dir, name, mode)?,
     };
     Ok(raw_file.to_file(handle.mgr))
+}
+
+/// Reads into `buffer` one 512-byte SD sector at a time, yielding to the
+/// executor after every sector. `embedded-sdmmc`'s read is synchronous and a
+/// large transfer can otherwise block this thread's executor for several
+/// milliseconds straight - long enough to starve `Timer::after_millis()`
+/// wakeups on other tasks (e.g. NeoPixel animation). Yielding once per sector
+/// caps the worst-case stall to a single-sector transfer instead of the whole
+/// buffer.
+///
+/// `_handle` is accepted for signature symmetry with the rest of this module;
+/// the read itself goes through `file`, which already carries its own
+/// `&SdVolumeManager` reference.
+///
+/// Returns the total bytes read, which is less than `buffer.len()` at EOF.
+pub async fn read_yielding(
+    _handle: SdHandle,
+    file: &mut SdFile<'static>,
+    buffer: &mut [u8],
+) -> Result<usize, SdError> {
+    let start = Instant::now(); // DIAG: remove after measuring SD stall duration
+    let mut total_read = 0;
+
+    for chunk in buffer.chunks_mut(512) {
+        let n = file.read(chunk)?;
+        total_read += n;
+
+        embassy_futures::yield_now().await;
+
+        if n == 0 {
+            break;
+        }
+    }
+
+    // DIAG: remove after measuring. Total wall time (spanning all the yields)
+    // that this read held the AUDIO_EXECUTOR interrupt busy for.
+    let elapsed_ms = (Instant::now() - start).as_millis();
+    if elapsed_ms > 1 {
+        println!("DIAG read_yielding: {} bytes in {}ms", total_read, elapsed_ms);
+    }
+
+    Ok(total_read)
 }

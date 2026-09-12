@@ -60,17 +60,49 @@ pub static DMX_MATRIX: BlockingMutex<CriticalSectionRawMutex, RefCell<[[u8; 512]
 
 static IP_STATE: StaticCell<AsyncMutex<CriticalSectionRawMutex, Option<Ipv4Address>>> = StaticCell::new();
 
-// The audio task runs on its own high-priority interrupt executor so it preempts
-// every thread-mode task (OLED I2C flush, NeoPixel effects, sACN parsing, ...).
-// The I2S PIO FIFO only holds ~180us of samples between DMA transfers; any
-// cooperative task that blocks the shared executor longer than that at a buffer
-// boundary causes an audible underrun. Preemption removes that whole class of
-// glitch. P3 keeps it below the hardware driver IRQs (DMA/timer) it depends on.
+// Only the I2S DMA feed (audio_output_task) runs on this interrupt executor -
+// it preempts every thread-mode task (OLED I2C flush, NeoPixel effects, sACN
+// parsing, ...), which matters because the I2S PIO FIFO only holds ~180us of
+// samples between DMA transfers; anything that blocks the executor longer than
+// that at a buffer boundary causes an audible underrun. P3 keeps it below the
+// hardware driver IRQs (DMA/timer) it depends on.
+//
+// MP3 decode + SD reads (audio_decode_task) deliberately do NOT run here: an
+// interrupt executor only lets *sibling tasks on the same executor* get a
+// turn when one yields, and audio_output_task is the only thing on it, so a
+// yield there is a no-op as far as thread-mode code is concerned - it can't
+// relieve starvation of neo_task/oled_task/etc. Decode runs as a normal
+// thread-mode task instead, spawned on the default `spawner` below, where its
+// cooperative yields (via sd::read_yielding) actually hand time to those
+// tasks.
 static AUDIO_EXECUTOR: InterruptExecutor = InterruptExecutor::new();
 
 #[interrupt]
 unsafe fn SWI_IRQ_1() {
     unsafe { AUDIO_EXECUTOR.on_interrupt() };
+}
+
+// DIAG: temporary - measures whether the *default thread-mode executor*
+// (where neo_task, dmx_task, oled_task etc. all run) is being starved, and by
+// how much, independent of any NeoPixel-specific code. If this task's actual
+// tick period spikes above ~2x its requested delay, thread-mode is being
+// preempted/starved for that long - most likely by AUDIO_EXECUTOR (P3
+// interrupt priority) running long between yields. Remove once diagnosed.
+#[embassy_executor::task]
+async fn diag_heartbeat_task() {
+    use embassy_time::{Instant, Timer};
+    const EXPECTED_MS: u64 = 5;
+
+    let mut last = Instant::now();
+    loop {
+        Timer::after_millis(EXPECTED_MS).await;
+        let now = Instant::now();
+        let elapsed = (now - last).as_millis();
+        if elapsed > EXPECTED_MS * 2 {
+            warn!("DIAG thread-mode stall: {}ms (wanted {}ms)", elapsed, EXPECTED_MS);
+        }
+        last = now;
+    }
 }
 
 
@@ -108,14 +140,18 @@ async fn main(spawner: Spawner) {
     let ip_state = IP_STATE.init(AsyncMutex::new(None));
     spawner.spawn(periphs::oled::oled_task(r.oled, ip_state)).unwrap(); // OLED
     spawner.spawn(periphs::dmx::dmx_task(r.dmx)).unwrap(); // DMX
+    spawner.spawn(diag_heartbeat_task()).unwrap(); // DIAG: remove after measuring
 
-    // DMX-triggered audio playback - on a dedicated high-priority interrupt
-    // executor so decode/DMA servicing preempts the thread-mode tasks. The SD
-    // card is mounted inside the task: its VolumeManager holds a RefCell (not
-    // Send), so the handle must never leave the executor it's used on.
+    // DMX-triggered audio playback, split across two tasks (see the
+    // AUDIO_EXECUTOR comment above for why): the I2S DMA feed runs on its own
+    // high-priority interrupt executor, while MP3 decode/SD reads run as a
+    // normal thread-mode task. The SD card is mounted inside audio_decode_task:
+    // its VolumeManager holds a RefCell (not Send), so the handle must never
+    // leave the executor it's used on.
     interrupt::SWI_IRQ_1.set_priority(Priority::P3);
     let audio_spawner = AUDIO_EXECUTOR.start(interrupt::SWI_IRQ_1);
-    audio_spawner.spawn(periphs::audio::audio_task(config.audio, r.audio, r.sd)).unwrap();
+    audio_spawner.spawn(periphs::audio::audio_output_task(r.audio)).unwrap();
+    spawner.spawn(periphs::audio::audio_decode_task(config.audio, r.sd)).unwrap();
 
     if config.input.source == InputProtocol::Artnet || config.input.source == InputProtocol::sACN {
         let stack = periphs::eth::start_eth(&spawner, r.eth, ip_state).await; // Ethernet
